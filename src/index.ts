@@ -1,12 +1,14 @@
-import { Hono } from 'hono';
+import { createApp } from './app';
+import { parseConfig } from './config';
+import { setLogLevel } from './lib/logger.lib';
 
-const app = new Hono();
+const config = parseConfig();
 
-app.get('/', (c) => {
-  return c.text('Hello Hono!');
-})
+// Apply application log level from config so it doesn't rely on process.env.LOG_LEVEL
+setLogLevel(config.APP_LOG_LEVEL);
+const app = createApp(config);
 
 export default {
   fetch: app.fetch,
-  port: Number(process.env.APP_PORT) ?? 1331,
+  port: Number(config.APP_PORT),
 };

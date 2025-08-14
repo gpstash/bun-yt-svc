@@ -29,5 +29,6 @@ COPY --from=deps /app/node_modules ./node_modules
 # Copy application source
 COPY --link . .
 
+EXPOSE 1331
 # Start the server by default, this can be overwritten at runtime
 CMD [ "bun", "src/index.ts" ]
