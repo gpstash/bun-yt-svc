@@ -13,6 +13,7 @@ v1InnertubeTranscriptRouter.get('/', async (c: Context<AppSchema>) => {
   const videoId = rawId?.trim();
 
   if (!videoId) {
+    logger.warn('Missing required query parameter', { param: 'v' });
     return c.json({ error: 'Missing video id' }, 400);
   }
 

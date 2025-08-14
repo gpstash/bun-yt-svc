@@ -67,6 +67,3 @@ export function generateTranscriptParams(
 
   return base64url(outerBytes);
 }
-
-// Examples:
-console.log(generateTranscriptParams("-4GmbBoYQjE", "id", true));

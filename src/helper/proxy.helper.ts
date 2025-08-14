@@ -1,5 +1,5 @@
-import { parseConfig } from '@/config.js';
-import { createLogger } from '@/lib/logger.lib.js';
+import { parseConfig } from '@/config';
+import { createLogger } from '@/lib/logger.lib';
 
 const logger = createLogger('helper:proxy');
 

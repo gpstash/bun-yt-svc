@@ -34,7 +34,7 @@ function nowIso(): string {
 }
 
 function asString(v: unknown): string {
-  if (v instanceof Error) return `${v.name}: ${v.message}`;
+  if (v instanceof Error) return v.stack || `${v.name}: ${v.message}`;
   if (typeof v === 'string') return v;
   try { return JSON.stringify(v); } catch { return String(v); }
 }

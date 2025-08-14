@@ -13,8 +13,9 @@ export function requestLogger(): MiddlewareHandler {
     const start = Date.now();
     const method = c.req.method;
     const url = c.req.url;
+    const userAgent = c.req.header('user-agent');
 
-    logger.info('BEGIN', { id, method, url });
+    logger.info('BEGIN', { id, method, url, userAgent });
     try {
       await next();
     } catch (err) {
@@ -23,7 +24,8 @@ export function requestLogger(): MiddlewareHandler {
     } finally {
       const durationMs = Date.now() - start;
       const status = c.res.status;
-      logger.info('END', { id, method, url, status, durationMs });
+      const contentLength = c.res.headers.get('content-length') || undefined;
+      logger.info('END', { id, method, url, status, durationMs, contentLength });
     }
   };
 }

@@ -79,10 +79,11 @@ export async function generatePoToken(videoId: string, visitorData: string): Pro
   const contentPoToken = await integrityTokenBasedMinter.mintAsWebsafeString(videoId);
   const sessionPoToken = await integrityTokenBasedMinter.mintAsWebsafeString(visitorData);
 
-  logger.debug('Visitor data:', decodeURIComponent(visitorData));
-  logger.debug('Content WebPO Token:', contentPoToken);
-  logger.debug('Session WebPO Token:', sessionPoToken);
-  logger.debug('Cold Start WebPO Token:', BG.PoToken.generateColdStartToken(visitorData), '\n');
+  const mask = (v: string) => (typeof v === 'string' ? `${v.length}b:***${v.slice(-4)}` : 'n/a');
+  logger.debug('Visitor data:', mask(decodeURIComponent(visitorData)));
+  logger.debug('Content WebPO Token:', mask(contentPoToken));
+  logger.debug('Session WebPO Token:', mask(sessionPoToken));
+  logger.debug('Cold Start WebPO Token:', mask(BG.PoToken.generateColdStartToken(visitorData)));
   // #endregion
 
   return { contentPoToken, sessionPoToken };
