@@ -19,11 +19,11 @@ export class InnertubeService {
   public static instance: InnertubeService;
   constructor(private readonly innertube: Innertube) { }
   private static readonly DEFAULT_HTTP_OPTIONS: Readonly<HttpOptions> = {
-    timeoutMs: 5000,
-    maxAttempts: 3,
+    timeoutMs: 12000,
+    maxAttempts: 2,
     retryOnStatus: [408, 429, 500, 502, 503, 504],
     backoffBaseMs: 100,
-    maxBackoffMs: 15_000,
+    maxBackoffMs: 3_000,
     retryMethods: ['GET', 'HEAD', 'OPTIONS', 'POST'], // Innertube frequently uses POST
     respectRetryAfter: true,
   } as const;
@@ -222,6 +222,27 @@ export class InnertubeService {
     return url.includes('/v1/player');
   }
 
+  private static isYouTubeDomain(url: string): boolean {
+    try {
+      const u = new URL(url);
+      const host = u.hostname.toLowerCase();
+      // Common YouTube-related hosts used by youtubei.js
+      return (
+        host.endsWith('.youtube.com') ||
+        host === 'youtube.com' ||
+        host.endsWith('.googlevideo.com') ||
+        host === 'googlevideo.com' ||
+        host.endsWith('.ytimg.com') ||
+        host === 'ytimg.com' ||
+        host.endsWith('.youtubei.googleapis.com') ||
+        host === 'youtubei.googleapis.com' ||
+        host === 'youtu.be'
+      );
+    } catch {
+      return false;
+    }
+  }
+
   private static toFetchArgs(input: RequestInfo | URL, init?: RequestInit): { url: string | URL; init?: RequestInit } {
     if (typeof input === 'string' || input instanceof URL) {
       return { url: input, init };
@@ -312,7 +333,7 @@ export class InnertubeService {
       ((input: string | URL | globalThis.Request, init?: RequestInit) => InnertubeService.fetch(input, init)) as typeof fetch,
       {
         // No-op to avoid extra network calls
-        preconnect: () => {}
+        preconnect: () => { }
       }
     ) as FetchWithPreconnect as unknown as typeof fetch;
 

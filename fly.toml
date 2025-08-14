@@ -3,30 +3,31 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'bun-yt-svc'
-primary_region = 'sin'
+app = "bun-yt-svc"
+primary_region = "sin"
 
 [build]
 
 [env]
-APP_PORT = '1331'
-APP_LOG_LEVEL = 'verbose'
+APP_PORT = "1331"
+APP_LOG_LEVEL = "verbose"
 
-PROXY_STATUS = 'active'
-PROXY_HOST = 'gw-ap.scrapeless.io'
-PROXY_PORT = '8789'
-PROXY_USERNAME = 'D29CFF5D3929-proxy-country_SG-r_0m-s_d1xTOzuzMk'
+PROXY_STATUS = "active"
+PROXY_HOST = "gw-ap.scrapeless.io"
+PROXY_PORT = "8789"
+PROXY_USERNAME = "D29CFF5D3929-proxy-country_SG-r_0m-s_d1xTOzuzMk"
 
-DNS_SERVER = '1.1.1.1'
-DNS_ALT = '1.0.0.1'
+DNS_SERVER = "1.1.1.1"
+DNS_ALT = "1.0.0.1"
 
 [http_service]
 internal_port = 1331
 force_https = true
-auto_stop_machines = 'stop'
+auto_stop_machines = "stop"
 auto_start_machines = true
 min_machines_running = 0
-processes = ['app']
+processes = ["app"]
 
 [[vm]]
-size = 'shared-cpu-1x'
+size = "shared-cpu-1x"
+memory = "512mb"
