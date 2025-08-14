@@ -8,12 +8,12 @@ const logger = createLogger('middleware:innertube');
 
 export function innertubeMiddleware(): MiddlewareHandler {
   return async (c: Context<AppSchema>, next: Next) => {
-    const innertubeSvc = InnertubeService.getInstance();
-    logger.debug('attach innertube service', {
+    const innertubeSvc = await InnertubeService.getInstance();
+    logger.debug('[innertubeMiddleware()] Attach InnertubeService instance to context', {
       method: c.req.method,
       url: c.req.url,
     });
     c.set('innertubeSvc', innertubeSvc);
-    return next();
+    return await next();
   };
 }

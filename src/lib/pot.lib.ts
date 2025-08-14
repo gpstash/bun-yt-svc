@@ -1,9 +1,12 @@
 import type { WebPoSignalOutput } from 'bgutils-js';
 import { BG, buildURL, GOOG_API_KEY, USER_AGENT } from 'bgutils-js';
-import { Innertube, YT, YTNodes, Context } from 'youtubei.js';
+import { Innertube } from 'youtubei.js';
 import { JSDOM } from 'jsdom';
+import { createLogger } from './logger.lib';
 
 const userAgent = USER_AGENT;
+
+const logger = createLogger('lib:pot');
 
 export async function generatePoToken(videoId: string, visitorData: string): Promise<{ contentPoToken: string, sessionPoToken: string }> {
   // @NOTE: Session cache is disabled so we can get a fresh visitor data string.
@@ -75,10 +78,10 @@ export async function generatePoToken(videoId: string, visitorData: string): Pro
   const contentPoToken = await integrityTokenBasedMinter.mintAsWebsafeString(videoId);
   const sessionPoToken = await integrityTokenBasedMinter.mintAsWebsafeString(visitorData);
 
-  console.info('Visitor data:', decodeURIComponent(visitorData));
-  console.info('Content WebPO Token:', contentPoToken);
-  console.info('Session WebPO Token:', sessionPoToken);
-  console.info('Cold Start WebPO Token:', BG.PoToken.generateColdStartToken(visitorData), '\n');
+  logger.debug('Visitor data:', decodeURIComponent(visitorData));
+  logger.debug('Content WebPO Token:', contentPoToken);
+  logger.debug('Session WebPO Token:', sessionPoToken);
+  logger.debug('Cold Start WebPO Token:', BG.PoToken.generateColdStartToken(visitorData), '\n');
   // #endregion
 
   return { contentPoToken, sessionPoToken };

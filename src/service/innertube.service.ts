@@ -1,7 +1,8 @@
 import { createLogger } from "@/lib/logger.lib";
-import { ClientType, Innertube, UniversalCache, YT } from "youtubei.js";
+import { ClientType, Innertube, Log, UniversalCache, YT } from "youtubei.js";
 import { generatePoToken } from "@/lib/pot.lib";
-import { parseVideoInfo, ParsedVideoInfo } from "@/helper/video.helper";
+import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedTranscript } from "@/helper/video.helper";
+import { http, HttpOptions } from "@/lib/http.lib";
 
 const logger = createLogger('service:InnertubeService');
 
@@ -15,12 +16,86 @@ export interface CreateInnertubeOptions {
 }
 
 export class InnertubeService {
-  public async getVideoInfo(id: string, parse: boolean): Promise<YT.VideoInfo | ParsedVideoInfo> {
-    let contentPoToken, sessionPoToken;
-    const webInnertube = await this.createInnertube({ withPlayer: true, generateSessionLocally: false });
+  public static instance: InnertubeService;
+  constructor(private readonly innertube: Innertube) { }
+  private static readonly DEFAULT_HTTP_OPTIONS: Readonly<HttpOptions> = {
+    timeoutMs: 5000,
+    maxAttempts: 3,
+    retryOnStatus: [408, 429, 500, 502, 503, 504],
+    backoffBaseMs: 100,
+    maxBackoffMs: 15_000,
+    retryMethods: ['GET', 'HEAD', 'OPTIONS', 'POST'], // Innertube frequently uses POST
+    respectRetryAfter: true,
+  } as const;
+
+  /**
+   * Fetch and parse video information with a normalized shape safe for clients.
+   */
+  public async getVideoInfo(id: string): Promise<ParsedVideoInfo> {
+    const info = await this.innertube.getInfo(id);
+    const parsedVideoInfo = parseVideoInfo(info);
+
+    // Remove baseUrl from captionLanguages
+    parsedVideoInfo.captionLanguages = parsedVideoInfo.captionLanguages.map((caption) => {
+      // avoid mutating original object reference
+      const { baseUrl: _omit, ...rest } = caption as { baseUrl?: string } & typeof caption;
+      return rest;
+    });
+
+    return parsedVideoInfo;
+  }
+
+  /**
+   * Retrieve transcript, optionally selecting a specific language.
+   */
+  public async getTranscript(id: string, language?: string): Promise<ParsedTranscript> {
+    try {
+      const info = await this.innertube.getInfo(id);
+      if (!hasCaptions(info)) {
+        return {
+          language: "",
+          transcriptLanguages: [],
+          hasTranscript: false,
+          segments: [],
+          text: "",
+        };
+      }
+
+      let selectedTranscript: YT.TranscriptInfo = await info.getTranscript();
+      if (language && Array.isArray(selectedTranscript?.languages) && selectedTranscript.languages.includes(language)) {
+        try {
+          selectedTranscript = await selectedTranscript.selectLanguage(language);
+        } catch (error) {
+          logger.warn('Language selection failed, fallback to default language', error);
+        }
+      }
+
+      return parseTranscript(selectedTranscript);
+    } catch (error) {
+      logger.error('Error getting transcript', error);
+      return {
+        language: "",
+        transcriptLanguages: [],
+        hasTranscript: false,
+        segments: [],
+        text: "",
+      };
+    }
+  }
+
+  public async getVideoInfoWithPoToken(id: string, parse: true): Promise<ParsedVideoInfo>;
+  public async getVideoInfoWithPoToken(id: string, parse: false): Promise<YT.VideoInfo>;
+  public async getVideoInfoWithPoToken(id: string, parse: boolean): Promise<YT.VideoInfo | ParsedVideoInfo> {
+    let contentPoToken: string, sessionPoToken: string;
+    const webInnertube = await InnertubeService.createInnertube({ withPlayer: true, generateSessionLocally: false });
     let clientName = webInnertube.session.context.client.clientName;
 
-    ({ contentPoToken, sessionPoToken } = await generatePoToken(id, webInnertube.session.context.client.visitorData!))
+    const visitorData = webInnertube.session.context.client.visitorData;
+    if (!visitorData) {
+      throw new Error('Missing visitorData in Innertube session context');
+    }
+
+    ({ contentPoToken, sessionPoToken } = await generatePoToken(id, visitorData))
     const info: YT.VideoInfo = await webInnertube.getInfo(id, { po_token: contentPoToken });
 
     // temporary workaround for SABR-only responses
@@ -41,10 +116,11 @@ export class InnertubeService {
         info?.playability_status?.reason === 'Sign in to confirm your age') ||
       (hasTrailer && trailerIsAgeRestricted)
     ) {
-      const webEmbeddedInnertube = await this.createInnertube({ clientType: ClientType.WEB_EMBEDDED })
+      const webEmbeddedInnertube = await InnertubeService.createInnertube({ clientType: ClientType.WEB_EMBEDDED })
       webEmbeddedInnertube.session.context.client.visitorData = webInnertube.session.context.client.visitorData
 
-      const videoId = hasTrailer && trailerIsAgeRestricted ? (info?.playability_status?.error_screen as any)?.video_id : id
+      const errorScreen = info?.playability_status?.error_screen as { video_id?: string } | undefined;
+      const videoId = hasTrailer && trailerIsAgeRestricted ? (errorScreen?.video_id ?? id) : id
 
       // getBasicInfo needs the signature timestamp (sts) from inside the player
       webEmbeddedInnertube.session.player = webInnertube.session.player
@@ -121,18 +197,105 @@ export class InnertubeService {
     return parse ? parseVideoInfo(info) : info
   }
 
-  public static instance: InnertubeService;
-  public static getInstance(): InnertubeService {
-    logger.debug('Get instance');
-    if (!this.instance) {
-      this.instance = new InnertubeService();
-      logger.debug('No instance found, create new instance');
+  public static async getInstance(): Promise<InnertubeService> {
+    if (this.instance) {
+      logger.info('[getInstance] Use existing InnertubService instance')
+      return this.instance;
     }
-    logger.debug('Return instance');
-    return this.instance;
+
+    logger.info('[getInstance] Create new InnertubService instance');
+    const innertube = await InnertubeService.createInnertube({ withPlayer: false, generateSessionLocally: false });
+    return this.instance = new InnertubeService(innertube);
   }
 
-  public async createInnertube(opts?: CreateInnertubeOptions): Promise<Innertube> {
+  private static asUrlString(input: RequestInfo | URL): string {
+    if (input instanceof URL) return input.toString();
+    if (typeof input === 'string') return input;
+    // Fall back to Request-like shape
+    const maybeUrl = (input as { url?: string }).url;
+    if (typeof maybeUrl === 'string') return maybeUrl;
+    throw new TypeError('Unsupported RequestInfo input: missing URL');
+  }
+
+  private static isPlayerEndpoint(url: string): boolean {
+    // YouTube v1 player endpoint is the usual throttling target
+    return url.includes('/v1/player');
+  }
+
+  private static toFetchArgs(input: RequestInfo | URL, init?: RequestInit): { url: string | URL; init?: RequestInit } {
+    if (typeof input === 'string' || input instanceof URL) {
+      return { url: input, init };
+    }
+    // Request-like object. Extract properties to plain init.
+    const req = input as Request;
+    const nextInit: RequestInit = {
+      method: req.method,
+      headers: req.headers as unknown as HeadersInit,
+      body: req.body as unknown as BodyInit | null,
+      // Preserve credentials/referrer/etc if provided in init, but do not override extracted core fields.
+      ...init,
+    };
+    return { url: req.url, init: nextInit };
+  }
+
+  public static async fetch(input: string | URL | globalThis.Request, init?: RequestInit): Promise<Response> {
+    const start = performance.now();
+    const targetUrl = InnertubeService.asUrlString(input);
+    const isPlayerEndpoint = InnertubeService.isPlayerEndpoint(targetUrl);
+    const isProxyEnabled = process.env.PROXY_STATUS === 'active';
+    const isProxyNeeded = isPlayerEndpoint && isProxyEnabled;
+    const { url, init: mergedInit } = InnertubeService.toFetchArgs(input, init);
+
+    let writableInit: RequestInit | undefined = mergedInit ? { ...mergedInit } : undefined;
+    if (isPlayerEndpoint && writableInit?.body && typeof writableInit.body === 'string') {
+      writableInit.body = (writableInit.body as string).replace('"videoId":', '"params":"8AEB","videoId":')
+    }
+
+    // Fast-path: use native fetch directly for non-player endpoints without proxy needs
+    if (!isPlayerEndpoint && !isProxyEnabled) {
+      const res = await fetch(url as any, writableInit);
+      logger.verbose('innertubeFetch native', {
+        url: String(url),
+        status: res.status,
+        durationMs: Math.round(performance.now() - start),
+      });
+      return res;
+    }
+
+    const requestOptions: HttpOptions = {
+      ...InnertubeService.DEFAULT_HTTP_OPTIONS,
+      // Only enable proxy when needed for the player endpoint
+      ...(isProxyNeeded ? { useProxy: true } : {})
+    }
+
+    logger.verbose('innertubeFetch start', {
+      url: String(url),
+      method: (writableInit?.method || 'GET').toUpperCase(),
+      via: isProxyNeeded ? 'PROXY' : 'DIRECT',
+    });
+
+    try {
+      const response = await http(url, writableInit, requestOptions);
+      logger.info('innertubeFetch done', {
+        url: String(url),
+        status: response.status,
+        via: isProxyNeeded ? 'PROXY' : 'DIRECT',
+        durationMs: Math.round(performance.now() - start),
+      });
+      return response;
+    } catch (err) {
+      logger.error('innertubeFetch error', {
+        url: String(url),
+        via: isProxyNeeded ? 'PROXY' : 'DIRECT',
+        durationMs: Math.round(performance.now() - start),
+        error: err,
+      });
+      throw err;
+    }
+  }
+
+  public static async createInnertube(opts?: CreateInnertubeOptions): Promise<Innertube> {
+    Log.setLevel(Log.Level.INFO)
     const { withPlayer, location, safetyMode, clientType, generateSessionLocally } = {
       withPlayer: false,
       safetyMode: false,
@@ -140,21 +303,36 @@ export class InnertubeService {
       ...opts,
     };
 
-    let cache;
+    let cache: UniversalCache | undefined;
     if (withPlayer) cache = new UniversalCache(false);
-    return await Innertube.create({
+
+    // youtubei.js expects a fetch with optional `preconnect`. Provide a compatible wrapper.
+    type FetchWithPreconnect = typeof fetch & { preconnect?: (url: string) => Promise<void> | void };
+    const fetchWithPreconnect = Object.assign(
+      ((input: string | URL | globalThis.Request, init?: RequestInit) => InnertubeService.fetch(input, init)) as typeof fetch,
+      {
+        // No-op to avoid extra network calls
+        preconnect: () => {}
+      }
+    ) as FetchWithPreconnect as unknown as typeof fetch;
+
+    const innertubeConfig = {
       // This setting is enabled by default and results in YouTube.js reusing the same session across different Innertube instances.
       // That behavior is highly undesirable for FreeTube, as we want to create a new session every time to limit tracking.
       enable_session_cache: false,
       retrieve_innertube_config: !generateSessionLocally,
-      user_agent: navigator.userAgent,
 
       retrieve_player: !!withPlayer,
       location: location,
       enable_safety_mode: !!safetyMode,
       client_type: clientType,
       cache,
-      generate_session_locally: !!generateSessionLocally
-    });
+      generate_session_locally: !!generateSessionLocally,
+      // Ensure all network requests go through our resilient HTTP client
+      fetch: fetchWithPreconnect
+    }
+
+    logger.debug('[createInnertube] Creating Innertube instance with config:', innertubeConfig);
+    return await Innertube.create(innertubeConfig);
   }
 }
