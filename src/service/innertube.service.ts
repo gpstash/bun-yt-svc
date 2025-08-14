@@ -27,7 +27,7 @@ export class InnertubeService {
   private static readonly requestContext = new AsyncLocalStorage<{ signal?: AbortSignal }>();
   private static readonly DEFAULT_HTTP_OPTIONS: Readonly<HttpOptions> = {
     timeoutMs: 12000,
-    maxAttempts: 2,
+    maxAttempts: 3,
     retryOnStatus: [408, 429, 500, 502, 503, 504],
     backoffBaseMs: 100,
     maxBackoffMs: 3_000,
@@ -98,7 +98,7 @@ export class InnertubeService {
   public async getVideoInfoWithPoToken(id: string, parse: false): Promise<YT.VideoInfo>;
   public async getVideoInfoWithPoToken(id: string, parse: boolean): Promise<YT.VideoInfo | ParsedVideoInfo> {
     let contentPoToken: string, sessionPoToken: string;
-    const webInnertube = await InnertubeService.createInnertube({ withPlayer: true, generateSessionLocally: false });
+    const webInnertube = await InnertubeService.createInnertube({ withPlayer: true });
     let clientName = webInnertube.session.context.client.clientName;
 
     const visitorData = webInnertube.session.context.client.visitorData;
@@ -215,7 +215,7 @@ export class InnertubeService {
     }
 
     logger.info('[getInstance] Create new InnertubService instance');
-    const innertube = await InnertubeService.createInnertube({ withPlayer: false, generateSessionLocally: false });
+    const innertube = await InnertubeService.createInnertube({ withPlayer: false });
     return this.instance = new InnertubeService(innertube);
   }
 
@@ -231,6 +231,21 @@ export class InnertubeService {
   private static isPlayerEndpoint(url: string): boolean {
     // YouTube v1 player endpoint is the usual throttling target
     return url.includes('/v1/player');
+  }
+
+  private static isYouTubeHost(url: string): boolean {
+    try {
+      const u = new URL(url);
+      const host = u.hostname;
+      return (
+        host.endsWith('youtube.com') ||
+        host.endsWith('googlevideo.com') ||
+        host.endsWith('ytimg.com') ||
+        host.endsWith('youtubei.googleapis.com')
+      );
+    } catch {
+      return false;
+    }
   }
 
   private static toFetchArgs(input: RequestInfo | URL, init?: RequestInit): { url: string | URL; init?: RequestInit } {
@@ -274,7 +289,8 @@ export class InnertubeService {
     const targetUrl = InnertubeService.asUrlString(input);
     const isPlayerEndpoint = InnertubeService.isPlayerEndpoint(targetUrl);
     const isProxyEnabled = process.env.PROXY_STATUS === 'active';
-    const isProxyNeeded = isPlayerEndpoint && isProxyEnabled;
+    // Only proxy the player endpoint when proxy is active
+    const isProxyNeeded = isProxyEnabled && isPlayerEndpoint;
     const { url, init: mergedInit } = InnertubeService.toFetchArgs(input, init);
 
     // Pull per-request signal (from router) if present
@@ -299,12 +315,16 @@ export class InnertubeService {
       return res;
     }
 
+    // Combine context and init signals for http(); stop retries on abort
+    const { signal: compositeSignal, cleanup: cleanupLinked } = InnertubeService.linkAbortSignals([
+      ctx?.signal,
+      (writableInit?.signal as AbortSignal | undefined),
+    ]);
+
     const requestOptions: HttpOptions = {
       ...InnertubeService.DEFAULT_HTTP_OPTIONS,
-      // Only enable proxy when needed for the player endpoint
       ...(isProxyNeeded ? { useProxy: true } : {}),
-      // Make http() honor aborts from both context and init.signal
-      signal: ctx?.signal,
+      signal: compositeSignal,
     }
 
     logger.verbose('innertubeFetch start', {
@@ -329,7 +349,31 @@ export class InnertubeService {
         durationMs: Math.round(performance.now() - start),
         error: err,
       });
+      // Failover: if DIRECT failed for player endpoint and proxy is enabled, retry once via proxy
+      if (!isProxyNeeded && isProxyEnabled && isPlayerEndpoint) {
+        logger.warn('innertubeFetch failover -> retrying via PROXY', { url: String(url) });
+        try {
+          const proxied = await http(url, writableInit, { ...requestOptions, useProxy: true });
+          logger.info('innertubeFetch done (failover)', {
+            url: String(url),
+            status: proxied.status,
+            via: 'PROXY',
+            durationMs: Math.round(performance.now() - start),
+          });
+          return proxied;
+        } catch (err2) {
+          logger.error('innertubeFetch failover error', {
+            url: String(url),
+            via: 'PROXY',
+            durationMs: Math.round(performance.now() - start),
+            error: err2,
+          });
+        }
+      }
       throw err;
+    } finally {
+      // Remove abort listeners
+      cleanupLinked();
     }
   }
 
@@ -338,7 +382,8 @@ export class InnertubeService {
     const { withPlayer, location, safetyMode, clientType, generateSessionLocally } = {
       withPlayer: false,
       safetyMode: false,
-      generateSessionLocally: false,
+      // Generate session locally to avoid sw.js_data and similar bootstrap calls
+      generateSessionLocally: true,
       ...opts,
     };
 
@@ -356,9 +401,9 @@ export class InnertubeService {
     ) as FetchWithPreconnect as unknown as typeof fetch;
 
     const innertubeConfig = {
-      // This setting is enabled by default and results in YouTube.js reusing the same session across different Innertube instances.
-      // That behavior is highly undesirable for FreeTube, as we want to create a new session every time to limit tracking.
-      enable_session_cache: false,
+      // Reuse session data across Innertube instances to reduce bootstrap traffic and flakiness
+      enable_session_cache: true,
+      // If we generate session locally, do not hit network to retrieve config
       retrieve_innertube_config: !generateSessionLocally,
 
       retrieve_player: !!withPlayer,
