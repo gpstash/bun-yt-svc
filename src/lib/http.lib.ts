@@ -1,4 +1,3 @@
-import { ProxyAgent, type Dispatcher } from 'undici';
 import { buildProxyUrlFromConfig } from '@/helper/proxy.helper';
 import { createLogger } from '@/lib/logger.lib';
 
@@ -153,6 +152,18 @@ export const http = async (
   const perAttemptTimeout = timeoutMs ?? timeoutAlias ?? 8000;
   const baseBackoff = backoffBaseMs ?? backoffAlias ?? 100;
 
+  // Prepare per-call proxy URL (Bun fetch native proxy support)
+  const proxyUrl: string | undefined = options?.useProxy
+    ? (options.proxyUrl ?? buildProxyUrlFromConfig())
+    : undefined;
+  if (options?.useProxy) {
+    if (proxyUrl) {
+      logger.debug('proxy enabled for request', { url: String(url), proxyUrl: String(proxyUrl) });
+    } else {
+      logger.warn('useProxy=true but no proxy URL provided/resolved');
+    }
+  }
+
   for (let attempt = 0; attempt < Math.max(1, maxAttempts); attempt++) {
     const timeoutController = new AbortController();
     let timedOut = false;
@@ -173,13 +184,10 @@ export const http = async (
         perAttemptTimeout,
       });
 
-      // Attach per-call proxy dispatcher if enabled
-      const requestInit = ({ ...init, signal: mergedSignal });
-      const response = await fetch(url as any, {
-        ...requestInit,
-        signal: mergedSignal,
-        ...(options?.useProxy ? { proxy: options.proxyUrl ?? buildProxyUrlFromConfig() } : {})
-      });
+      // Attach Bun fetch native proxy option if enabled
+      const requestInit: RequestInit & { proxy?: string } = { ...init, signal: mergedSignal };
+      if (proxyUrl) requestInit.proxy = proxyUrl;
+      const response = await fetch(url as any, requestInit as RequestInit);
 
       if (response.ok) {
         logger.verbose('response ok', { url: String(url), status: response.status });
@@ -212,7 +220,13 @@ export const http = async (
 
       onRetry?.({ ...ctx, delayMs });
       logger.verbose('retrying after non-ok', { url: String(url), status, attempt, delayMs });
-      await sleep(delayMs, outerSignal);
+      // Sleep should also react to init.signal aborts, not just outerSignal
+      const { signal: sleepSignal, cleanup: sleepCleanup } = linkAbortSignals([outerSignal, (init?.signal ?? undefined) as AbortSignal | undefined]);
+      try {
+        await sleep(delayMs, sleepSignal);
+      } finally {
+        sleepCleanup();
+      }
       continue;
     } catch (err) {
       const isAborted = isAbortError(err);
@@ -236,7 +250,12 @@ export const http = async (
       const delayMs = computeJitterBackoff(baseBackoff, attempt, maxBackoffMs);
       onRetry?.({ url, init, attempt, maxAttempts, error: err, delayMs });
       logger.verbose('retrying after error', { url: String(url), attempt, delayMs, aborted: isAborted, timedOut });
-      await sleep(delayMs, outerSignal);
+      const { signal: sleepSignal, cleanup: sleepCleanup } = linkAbortSignals([outerSignal, (init?.signal ?? undefined) as AbortSignal | undefined]);
+      try {
+        await sleep(delayMs, sleepSignal);
+      } finally {
+        sleepCleanup();
+      }
       continue;
     } finally {
       clearTimeout(timeoutId);
