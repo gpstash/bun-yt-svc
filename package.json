@@ -1,7 +1,9 @@
 {
   "name": "bun-yt-svc",
   "scripts": {
-    "dev": "bun run --hot src/index.ts"
+    "dev": "bun run --hot src/index.ts",
+    "build": "bun build --target=bun --minify --sourcemap --outdir=dist src/index.ts",
+    "start": "bun run dist/index.js"
   },
   "dependencies": {
     "bgutils-js": "^3.2.0",

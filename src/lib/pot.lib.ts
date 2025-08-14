@@ -1,7 +1,6 @@
 import type { WebPoSignalOutput } from 'bgutils-js';
 import { BG, buildURL, GOOG_API_KEY, USER_AGENT } from 'bgutils-js';
 import { Innertube } from 'youtubei.js';
-import { JSDOM } from 'jsdom';
 import { createLogger } from './logger.lib';
 
 const userAgent = USER_AGENT;
@@ -13,6 +12,8 @@ export async function generatePoToken(videoId: string, visitorData: string): Pro
   const innertube = await Innertube.create({ user_agent: userAgent, enable_session_cache: false });
 
   // #region BotGuard Initialization
+  // Lazy-load jsdom only when this function is invoked to avoid cold-start overhead
+  const { JSDOM } = await import('jsdom');
   const dom = new JSDOM('<!DOCTYPE html><html lang="en"><head><title></title></head><body></body></html>', {
     url: 'https://www.youtube.com/',
     referrer: 'https://www.youtube.com/',

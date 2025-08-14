@@ -1,6 +1,5 @@
 import { createLogger } from "@/lib/logger.lib";
 import { ClientType, Innertube, Log, UniversalCache, YT } from "youtubei.js";
-import { generatePoToken } from "@/lib/pot.lib";
 import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedTranscript } from "@/helper/video.helper";
 import { http, HttpOptions } from "@/lib/http.lib";
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -97,6 +96,8 @@ export class InnertubeService {
   public async getVideoInfoWithPoToken(id: string, parse: true): Promise<ParsedVideoInfo>;
   public async getVideoInfoWithPoToken(id: string, parse: false): Promise<YT.VideoInfo>;
   public async getVideoInfoWithPoToken(id: string, parse: boolean): Promise<YT.VideoInfo | ParsedVideoInfo> {
+    // Lazy import to avoid loading heavy deps (e.g., jsdom) during cold start
+    const { generatePoToken } = await import("@/lib/pot.lib");
     let contentPoToken: string, sessionPoToken: string;
     const webInnertube = await InnertubeService.createInnertube({ withPlayer: true });
     let clientName = webInnertube.session.context.client.clientName;
