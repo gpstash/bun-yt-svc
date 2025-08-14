@@ -3,6 +3,7 @@ import { ClientType, Innertube, Log, UniversalCache, YT } from "youtubei.js";
 import { generatePoToken } from "@/lib/pot.lib";
 import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedTranscript } from "@/helper/video.helper";
 import { http, HttpOptions } from "@/lib/http.lib";
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 const logger = createLogger('service:InnertubeService');
 
@@ -22,6 +23,8 @@ export interface RequestOptions {
 export class InnertubeService {
   public static instance: InnertubeService;
   constructor(private readonly innertube: Innertube) { }
+  // Per-request context to carry AbortSignal from router -> service -> innertube fetches
+  private static readonly requestContext = new AsyncLocalStorage<{ signal?: AbortSignal }>();
   private static readonly DEFAULT_HTTP_OPTIONS: Readonly<HttpOptions> = {
     timeoutMs: 12000,
     maxAttempts: 2,
@@ -36,7 +39,9 @@ export class InnertubeService {
    * Fetch and parse video information with a normalized shape safe for clients.
    */
   public async getVideoInfo(id: string, opts?: RequestOptions): Promise<ParsedVideoInfo> {
-    const info = await this.innertube.getInfo(id);
+    const info = await InnertubeService.requestContext.run({ signal: opts?.signal }, async () => {
+      return await this.innertube.getInfo(id);
+    });
     const parsedVideoInfo = parseVideoInfo(info);
 
     // Remove baseUrl from captionLanguages
@@ -54,7 +59,9 @@ export class InnertubeService {
    */
   public async getTranscript(id: string, language?: string, opts?: RequestOptions): Promise<ParsedTranscript> {
     try {
-      const info = await this.innertube.getInfo(id);
+      const info = await InnertubeService.requestContext.run({ signal: opts?.signal }, async () => {
+        return await this.innertube.getInfo(id);
+      });
       if (!hasCaptions(info)) {
         return {
           language: "",
@@ -226,27 +233,6 @@ export class InnertubeService {
     return url.includes('/v1/player');
   }
 
-  private static isYouTubeDomain(url: string): boolean {
-    try {
-      const u = new URL(url);
-      const host = u.hostname.toLowerCase();
-      // Common YouTube-related hosts used by youtubei.js
-      return (
-        host.endsWith('.youtube.com') ||
-        host === 'youtube.com' ||
-        host.endsWith('.googlevideo.com') ||
-        host === 'googlevideo.com' ||
-        host.endsWith('.ytimg.com') ||
-        host === 'ytimg.com' ||
-        host.endsWith('.youtubei.googleapis.com') ||
-        host === 'youtubei.googleapis.com' ||
-        host === 'youtu.be'
-      );
-    } catch {
-      return false;
-    }
-  }
-
   private static toFetchArgs(input: RequestInfo | URL, init?: RequestInit): { url: string | URL; init?: RequestInit } {
     if (typeof input === 'string' || input instanceof URL) {
       return { url: input, init };
@@ -263,6 +249,26 @@ export class InnertubeService {
     return { url: req.url, init: nextInit };
   }
 
+  // Link multiple AbortSignals into a single composite signal.
+  private static linkAbortSignals(signals: (AbortSignal | undefined)[]) {
+    const controller = new AbortController();
+    if (signals.some(s => s?.aborted)) {
+      controller.abort();
+      return { signal: controller.signal, cleanup: () => { } };
+    }
+    const handlers: Array<() => void> = [];
+    for (const s of signals) {
+      if (!s) continue;
+      const onAbort = () => controller.abort((s as any).reason);
+      s.addEventListener('abort', onAbort, { once: true });
+      handlers.push(() => s.removeEventListener('abort', onAbort));
+    }
+    return {
+      signal: controller.signal,
+      cleanup: () => handlers.forEach(h => h()),
+    };
+  }
+
   public static async fetch(input: string | URL | globalThis.Request, init?: RequestInit): Promise<Response> {
     const start = performance.now();
     const targetUrl = InnertubeService.asUrlString(input);
@@ -271,6 +277,9 @@ export class InnertubeService {
     const isProxyNeeded = isPlayerEndpoint && isProxyEnabled;
     const { url, init: mergedInit } = InnertubeService.toFetchArgs(input, init);
 
+    // Pull per-request signal (from router) if present
+    const ctx = InnertubeService.requestContext.getStore();
+
     let writableInit: RequestInit | undefined = mergedInit ? { ...mergedInit } : undefined;
     if (isPlayerEndpoint && writableInit?.body && typeof writableInit.body === 'string') {
       writableInit.body = (writableInit.body as string).replace('"videoId":', '"params":"8AEB","videoId":')
@@ -278,19 +287,24 @@ export class InnertubeService {
 
     // Fast-path: use native fetch directly for non-player endpoints without proxy needs
     if (!isPlayerEndpoint && !isProxyEnabled) {
-      const res = await fetch(url as any, writableInit);
+      // Combine context signal and any init.signal
+      const { signal, cleanup } = InnertubeService.linkAbortSignals([ctx?.signal, (writableInit?.signal as AbortSignal | undefined)]);
+      const res = await fetch(url as any, { ...(writableInit || {}), signal } as RequestInit);
       logger.verbose('innertubeFetch native', {
         url: String(url),
         status: res.status,
         durationMs: Math.round(performance.now() - start),
       });
+      cleanup();
       return res;
     }
 
     const requestOptions: HttpOptions = {
       ...InnertubeService.DEFAULT_HTTP_OPTIONS,
       // Only enable proxy when needed for the player endpoint
-      ...(isProxyNeeded ? { useProxy: true } : {})
+      ...(isProxyNeeded ? { useProxy: true } : {}),
+      // Make http() honor aborts from both context and init.signal
+      signal: ctx?.signal,
     }
 
     logger.verbose('innertubeFetch start', {
