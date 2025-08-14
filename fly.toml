@@ -16,7 +16,6 @@ PROXY_STATUS = 'active'
 PROXY_HOST = 'gw-ap.scrapeless.io'
 PROXY_PORT = '8789'
 PROXY_USERNAME = 'D29CFF5D3929-proxy-country_SG-r_0m-s_d1xTOzuzMk'
-PROXY_PASSWORD = 'TvRWiRAT'
 
 DNS_SERVER = '1.1.1.1'
 DNS_ALT = '1.0.0.1'
