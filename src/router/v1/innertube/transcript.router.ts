@@ -15,6 +15,6 @@ v1InnertubeTranscriptRouter.get('/', async (c: Context<AppSchema>) => {
     return c.json({ error: 'Missing video id' }, 400);
   }
 
-  const info = await c.get('innertubeSvc').getTranscript(videoId, language);
+  const info = await c.get('innertubeSvc').getTranscript(videoId, language, { signal: c.get('signal') });
   return c.json(info);
 });

@@ -8,6 +8,7 @@ import { InnertubeService } from './service/innertube.service';
 export interface AppVariables {
   config: AppConfig;
   innertubeSvc: InnertubeService;
+  signal: AbortSignal;
 }
 
 export interface AppSchema {

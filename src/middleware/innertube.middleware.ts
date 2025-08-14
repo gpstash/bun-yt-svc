@@ -14,6 +14,7 @@ export function innertubeMiddleware(): MiddlewareHandler {
       url: c.req.url,
     });
     c.set('innertubeSvc', innertubeSvc);
+    c.set('signal', c.req.raw.signal)
     return await next();
   };
 }

@@ -14,6 +14,6 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
     return c.json({ error: 'Missing video id' }, 400);
   }
 
-  const info = await c.get('innertubeSvc').getVideoInfo(videoId);
+  const info = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal') });
   return c.json(info);
 });

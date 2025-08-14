@@ -15,6 +15,10 @@ export interface CreateInnertubeOptions {
   generateSessionLocally?: boolean;
 }
 
+export interface RequestOptions {
+  signal?: AbortSignal;
+}
+
 export class InnertubeService {
   public static instance: InnertubeService;
   constructor(private readonly innertube: Innertube) { }
@@ -31,7 +35,7 @@ export class InnertubeService {
   /**
    * Fetch and parse video information with a normalized shape safe for clients.
    */
-  public async getVideoInfo(id: string): Promise<ParsedVideoInfo> {
+  public async getVideoInfo(id: string, opts?: RequestOptions): Promise<ParsedVideoInfo> {
     const info = await this.innertube.getInfo(id);
     const parsedVideoInfo = parseVideoInfo(info);
 
@@ -48,7 +52,7 @@ export class InnertubeService {
   /**
    * Retrieve transcript, optionally selecting a specific language.
    */
-  public async getTranscript(id: string, language?: string): Promise<ParsedTranscript> {
+  public async getTranscript(id: string, language?: string, opts?: RequestOptions): Promise<ParsedTranscript> {
     try {
       const info = await this.innertube.getInfo(id);
       if (!hasCaptions(info)) {
