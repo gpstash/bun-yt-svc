@@ -2,6 +2,7 @@ import { createLogger } from '@/lib/logger.lib';
 import { HttpError } from '@/lib/http.lib';
 import { Context, Hono } from 'hono';
 import type { AppSchema } from '@/app';
+import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST } from '@/lib/hono.util';
 
 export const v1InnertubeTranscriptRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:transcript');
@@ -11,23 +12,23 @@ v1InnertubeTranscriptRouter.get('/', async (c: Context<AppSchema>) => {
   const rawId = c.req.query('v');
   const language = c.req.query('l');
   const videoId = rawId?.trim();
+  const requestId = c.get('requestId');
 
   if (!videoId) {
-    logger.warn('Missing required query parameter', { param: 'v' });
+    logger.warn('Missing required query parameter', { param: 'v', requestId });
     return c.json({ error: 'Missing video id' }, 400);
   }
 
   try {
-    const info = await c.get('innertubeSvc').getTranscript(videoId, language, { signal: c.get('signal') });
+    const info = await c.get('innertubeSvc').getTranscript(videoId, language, { signal: c.get('signal'), requestId });
     return c.json(info);
   } catch (err) {
-    const isAbort = (err instanceof HttpError && (err as HttpError).code === 'EABORT') ||
-      ((err as any)?.name === 'AbortError');
+    const isAbort = isClientAbort(err) || (err instanceof HttpError && (err as HttpError).code === 'EABORT');
     if (isAbort) {
-      logger.info('Request aborted by client', { videoId, language });
-      return c.json({ error: 'Client Closed Request' }, 499 as any);
+      logger.info('Request aborted by client', { videoId, language, requestId });
+      return c.json({ error: 'Client Closed Request' }, STATUS_CLIENT_CLOSED_REQUEST as any);
     }
-    logger.error('Unexpected error in /v1/innertube/transcript', err);
+    logger.error('Unexpected error in /v1/innertube/transcript', { err, videoId, language, requestId });
     return c.json({ error: 'Internal Server Error' }, 500);
   }
 });

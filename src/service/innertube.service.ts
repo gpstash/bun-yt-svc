@@ -1,4 +1,4 @@
-import { createLogger } from "@/lib/logger.lib";
+import { createLogger, getLogLevel, LogLevel } from "@/lib/logger.lib";
 import { ClientType, Innertube, Log, UniversalCache, YT } from "youtubei.js";
 import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedTranscript } from "@/helper/video.helper";
 import { http, HttpOptions } from "@/lib/http.lib";
@@ -17,13 +17,14 @@ export interface CreateInnertubeOptions {
 
 export interface RequestOptions {
   signal?: AbortSignal;
+  requestId?: string;
 }
 
 export class InnertubeService {
   public static instance: InnertubeService;
   constructor(private readonly innertube: Innertube) { }
   // Per-request context to carry AbortSignal from router -> service -> innertube fetches
-  private static readonly requestContext = new AsyncLocalStorage<{ signal?: AbortSignal }>();
+  private static readonly requestContext = new AsyncLocalStorage<{ signal?: AbortSignal; requestId?: string }>();
   private static readonly DEFAULT_HTTP_OPTIONS: Readonly<HttpOptions> = {
     timeoutMs: 12000,
     maxAttempts: 3,
@@ -38,8 +39,13 @@ export class InnertubeService {
    * Fetch and parse video information with a normalized shape safe for clients.
    */
   public async getVideoInfo(id: string, opts?: RequestOptions): Promise<ParsedVideoInfo> {
-    const info = await InnertubeService.requestContext.run({ signal: opts?.signal }, async () => {
-      return await this.innertube.getInfo(id);
+    const started = performance.now();
+    const info = await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
+      const ctx = InnertubeService.requestContext.getStore();
+      logger.debug('getVideoInfo:start', { id, requestId: ctx?.requestId });
+      const res = await this.innertube.getInfo(id);
+      logger.debug('getVideoInfo:fetched', { id, requestId: ctx?.requestId });
+      return res;
     });
     const parsedVideoInfo = parseVideoInfo(info);
 
@@ -50,6 +56,9 @@ export class InnertubeService {
       return rest;
     });
 
+    const durationMs = Math.round(performance.now() - started);
+    const ctx2 = InnertubeService.requestContext.getStore();
+    logger.info('getVideoInfo:done', { id, durationMs, requestId: ctx2?.requestId });
     return parsedVideoInfo;
   }
 
@@ -58,8 +67,13 @@ export class InnertubeService {
    */
   public async getTranscript(id: string, language?: string, opts?: RequestOptions): Promise<ParsedTranscript> {
     try {
-      const info = await InnertubeService.requestContext.run({ signal: opts?.signal }, async () => {
-        return await this.innertube.getInfo(id);
+      const started = performance.now();
+      const info = await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
+        const ctx = InnertubeService.requestContext.getStore();
+        logger.debug('getTranscript:start', { id, language, requestId: ctx?.requestId });
+        const res = await this.innertube.getInfo(id);
+        logger.debug('getTranscript:fetched', { id, language, requestId: ctx?.requestId });
+        return res;
       });
       if (!hasCaptions(info)) {
         return {
@@ -80,9 +94,14 @@ export class InnertubeService {
         }
       }
 
-      return parseTranscript(selectedTranscript);
+      const parsed = parseTranscript(selectedTranscript);
+      const durationMs = Math.round(performance.now() - started);
+      const ctx2 = InnertubeService.requestContext.getStore();
+      logger.info('getTranscript:done', { id, language, durationMs, requestId: ctx2?.requestId, hasTranscript: parsed.hasTranscript });
+      return parsed;
     } catch (error) {
-      logger.error('Error getting transcript', error);
+      const ctx = InnertubeService.requestContext.getStore();
+      logger.error('Error getting transcript', { id, language, requestId: ctx?.requestId, error });
       return {
         language: "",
         transcriptLanguages: [],
@@ -211,11 +230,11 @@ export class InnertubeService {
 
   public static async getInstance(): Promise<InnertubeService> {
     if (this.instance) {
-      logger.info('[getInstance] Use existing InnertubService instance')
+      logger.info('[getInstance] Use existing InnertubeService instance')
       return this.instance;
     }
 
-    logger.info('[getInstance] Create new InnertubService instance');
+    logger.info('[getInstance] Create new InnertubeService instance');
     const innertube = await InnertubeService.createInnertube({ withPlayer: false });
     return this.instance = new InnertubeService(innertube);
   }
@@ -311,6 +330,7 @@ export class InnertubeService {
         url: String(url),
         status: res.status,
         durationMs: Math.round(performance.now() - start),
+        requestId: ctx?.requestId,
       });
       cleanup();
       return res;
@@ -332,6 +352,7 @@ export class InnertubeService {
       url: String(url),
       method: (writableInit?.method || 'GET').toUpperCase(),
       via: isProxyNeeded ? 'PROXY' : 'DIRECT',
+      requestId: ctx?.requestId,
     });
 
     try {
@@ -341,6 +362,7 @@ export class InnertubeService {
         status: response.status,
         via: isProxyNeeded ? 'PROXY' : 'DIRECT',
         durationMs: Math.round(performance.now() - start),
+        requestId: ctx?.requestId,
       });
       return response;
     } catch (err) {
@@ -349,10 +371,11 @@ export class InnertubeService {
         via: isProxyNeeded ? 'PROXY' : 'DIRECT',
         durationMs: Math.round(performance.now() - start),
         error: err,
+        requestId: ctx?.requestId,
       });
       // Failover: if DIRECT failed for player endpoint and proxy is enabled, retry once via proxy
       if (!isProxyNeeded && isProxyEnabled && isPlayerEndpoint) {
-        logger.warn('innertubeFetch failover -> retrying via PROXY', { url: String(url) });
+        logger.warn('innertubeFetch failover -> retrying via PROXY', { url: String(url), requestId: ctx?.requestId });
         try {
           const proxied = await http(url, writableInit, { ...requestOptions, useProxy: true });
           logger.info('innertubeFetch done (failover)', {
@@ -360,6 +383,7 @@ export class InnertubeService {
             status: proxied.status,
             via: 'PROXY',
             durationMs: Math.round(performance.now() - start),
+            requestId: ctx?.requestId,
           });
           return proxied;
         } catch (err2) {
@@ -368,6 +392,7 @@ export class InnertubeService {
             via: 'PROXY',
             durationMs: Math.round(performance.now() - start),
             error: err2,
+            requestId: ctx?.requestId,
           });
         }
       }
@@ -379,7 +404,17 @@ export class InnertubeService {
   }
 
   public static async createInnertube(opts?: CreateInnertubeOptions): Promise<Innertube> {
-    Log.setLevel(Log.Level.INFO)
+    // Map our app log level to youtubei.js log level
+    const lvl = getLogLevel();
+    const map: Record<LogLevel, number> = {
+      silent: Log.Level.NONE,
+      error: Log.Level.ERROR,
+      warn: Log.Level.WARNING,
+      info: Log.Level.INFO,
+      debug: Log.Level.DEBUG,
+      verbose: Log.Level.DEBUG,
+    } as const;
+    Log.setLevel(map[lvl] ?? Log.Level.INFO);
     const { withPlayer, location, safetyMode, clientType, generateSessionLocally } = {
       withPlayer: false,
       safetyMode: false,

@@ -1,15 +1,15 @@
-import type { MiddlewareHandler } from "hono";
+import type { MiddlewareHandler, Next } from "hono";
 import { createLogger } from "@/lib/logger.lib";
+import { AppSchema } from "@/app";
+import { Context } from "hono";
 
 const logger = createLogger('request');
 
-function generateRequestId() {
-  return crypto.randomUUID()
-}
-
-export function requestLogger(): MiddlewareHandler {
-  return async (c, next) => {
-    const id = generateRequestId();
+export function requestLogger(): MiddlewareHandler<AppSchema> {
+  return async (c: Context<AppSchema>, next: Next) => {
+    const headerId = c.req.header('x-requestid') || c.req.header('x-request-id') || undefined;
+    const id = headerId && headerId.trim().length > 0 ? headerId.trim() : crypto.randomUUID();
+    c.set('requestId', id as unknown as string);
     const start = Date.now();
     const method = c.req.method;
     const url = c.req.url;

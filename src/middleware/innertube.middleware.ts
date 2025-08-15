@@ -6,7 +6,7 @@ import { InnertubeService } from "@/service/innertube.service";
 
 const logger = createLogger('middleware:innertube');
 
-export function innertubeMiddleware(): MiddlewareHandler {
+export function innertubeMiddleware(): MiddlewareHandler<AppSchema> {
   return async (c: Context<AppSchema>, next: Next) => {
     const innertubeSvc = await InnertubeService.getInstance();
     logger.debug('[innertubeMiddleware()] Attach InnertubeService instance to context', {
