@@ -141,7 +141,14 @@ export class InnertubeService {
     // Lazy import to avoid loading heavy deps (e.g., jsdom) during cold start
     const { generatePoToken } = await import("@/lib/pot.lib");
     let contentPoToken: string, sessionPoToken: string;
-    const webInnertube = await InnertubeService.createInnertube({ withPlayer: true });
+    let webInnertube: Innertube;
+    const ctx = InnertubeService.requestContext.getStore();
+    try {
+      webInnertube = await InnertubeService.createInnertube({ withPlayer: true });
+    } catch (error) {
+      logger.error('getVideoInfoWithPoToken:createInnertube error', { id, requestId: ctx?.requestId, error });
+      throw error;
+    }
     let clientName = webInnertube.session.context.client.clientName;
 
     const visitorData = webInnertube.session.context.client.visitorData;
@@ -149,11 +156,28 @@ export class InnertubeService {
       throw new Error('Missing visitorData in Innertube session context');
     }
 
-    ({ contentPoToken, sessionPoToken } = await generatePoToken(id, visitorData))
-    const info: YT.VideoInfo = await webInnertube.getInfo(id, { po_token: contentPoToken });
+    try {
+      ({ contentPoToken, sessionPoToken } = await generatePoToken(id, visitorData))
+    } catch (error) {
+      logger.error('getVideoInfoWithPoToken:generatePoToken error', { id, requestId: ctx?.requestId, error });
+      throw error;
+    }
+    let info: YT.VideoInfo;
+    try {
+      info = await webInnertube.getInfo(id, { po_token: contentPoToken });
+    } catch (error) {
+      logger.error('getVideoInfoWithPoToken:getInfo error', { id, requestId: ctx?.requestId, error });
+      throw error;
+    }
 
     // temporary workaround for SABR-only responses
-    const mwebInfo = await webInnertube.getBasicInfo(id, { client: 'MWEB', po_token: contentPoToken })
+    let mwebInfo: YT.VideoInfo | undefined;
+    try {
+      mwebInfo = await webInnertube.getBasicInfo(id, { client: 'MWEB', po_token: contentPoToken })
+    } catch (error) {
+      // Best-effort workaround; do not fail request if MWEB path errors
+      logger.warn('getVideoInfoWithPoToken:MWEB getBasicInfo failed; continuing with WEB info', { id, requestId: ctx?.requestId, error });
+    }
 
     if (mwebInfo?.playability_status?.status === 'OK' && mwebInfo?.streaming_data) {
       info.playability_status = mwebInfo.playability_status
@@ -170,29 +194,34 @@ export class InnertubeService {
         info?.playability_status?.reason === 'Sign in to confirm your age') ||
       (hasTrailer && trailerIsAgeRestricted)
     ) {
-      const webEmbeddedInnertube = await InnertubeService.createInnertube({ clientType: ClientType.WEB_EMBEDDED })
-      webEmbeddedInnertube.session.context.client.visitorData = webInnertube.session.context.client.visitorData
+      try {
+        const webEmbeddedInnertube = await InnertubeService.createInnertube({ clientType: ClientType.WEB_EMBEDDED })
+        webEmbeddedInnertube.session.context.client.visitorData = webInnertube.session.context.client.visitorData
 
-      const errorScreen = info?.playability_status?.error_screen as { video_id?: string } | undefined;
-      const videoId = hasTrailer && trailerIsAgeRestricted ? (errorScreen?.video_id ?? id) : id
+        const errorScreen = info?.playability_status?.error_screen as { video_id?: string } | undefined;
+        const videoId = hasTrailer && trailerIsAgeRestricted ? (errorScreen?.video_id ?? id) : id
 
-      // getBasicInfo needs the signature timestamp (sts) from inside the player
-      webEmbeddedInnertube.session.player = webInnertube.session.player
+        // getBasicInfo needs the signature timestamp (sts) from inside the player
+        webEmbeddedInnertube.session.player = webInnertube.session.player
 
-      const bypassedInfo = await webEmbeddedInnertube.getBasicInfo(videoId, { client: 'WEB_EMBEDDED', po_token: contentPoToken })
+        const bypassedInfo = await webEmbeddedInnertube.getBasicInfo(videoId, { client: 'WEB_EMBEDDED', po_token: contentPoToken })
 
-      if (bypassedInfo?.playability_status?.status === 'OK' && bypassedInfo?.streaming_data) {
-        info.playability_status = bypassedInfo.playability_status
-        info.streaming_data = bypassedInfo.streaming_data
-        info.basic_info.start_timestamp = bypassedInfo.basic_info.start_timestamp
-        info.basic_info.duration = bypassedInfo.basic_info.duration
-        info.captions = bypassedInfo.captions
-        info.storyboards = bypassedInfo.storyboards
+        if (bypassedInfo?.playability_status?.status === 'OK' && bypassedInfo?.streaming_data) {
+          info.playability_status = bypassedInfo.playability_status
+          info.streaming_data = bypassedInfo.streaming_data
+          info.basic_info.start_timestamp = bypassedInfo.basic_info.start_timestamp
+          info.basic_info.duration = bypassedInfo.basic_info.duration
+          info.captions = bypassedInfo.captions
+          info.storyboards = bypassedInfo.storyboards
 
-        hasTrailer = false
-        trailerIsAgeRestricted = false
+          hasTrailer = false
+          trailerIsAgeRestricted = false
 
-        clientName = webEmbeddedInnertube.session.context.client.clientName
+          clientName = webEmbeddedInnertube.session.context.client.clientName
+        }
+      } catch (error) {
+        // Best-effort bypass; log and continue with existing info if WEB_EMBEDDED path fails
+        logger.warn('getVideoInfoWithPoToken:WEB_EMBEDDED bypass failed; continuing without bypass', { id, requestId: ctx?.requestId, error });
       }
     }
 
@@ -412,7 +441,6 @@ export class InnertubeService {
   }
 
   public static async createInnertube(opts?: CreateInnertubeOptions): Promise<Innertube> {
-    // Map our app log level to youtubei.js log level
     Log.setLevel(Log.Level.INFO);
     const { withPlayer, location, safetyMode, clientType, generateSessionLocally } = {
       withPlayer: false,
