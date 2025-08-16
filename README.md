@@ -119,7 +119,8 @@ curl "http://localhost:1331/v1/innertube/transcript?v=dQw4w9WgXcQ&l=en"
 
 Notes:
 
-- If a transcript is unavailable, the service returns `hasTranscript: false` and empty arrays/strings.
+- If a video has no captions/tracks, the service returns `hasTranscript: false` and empty arrays/strings.
+- If transcript fetching fails (network/Innertube/playability), the endpoint returns an error with a precise code (see Error codes).
 
 
 ## Logging
@@ -210,6 +211,20 @@ When `PROXY_STATUS=active`, only the Innertube player endpoint requests are prox
 
 - Per-attempt timeouts (default 8s), retries with exponential jitter, respect `Retry-After` for 429/503.
 - Maps client aborts to 499 in routers.
+
+### Error codes
+
+Routers map errors via `mapErrorToHttp()` in `src/lib/hono.util.ts` to canonical codes:
+
+- Client: `CLIENT_CLOSED_REQUEST` (499), `BAD_REQUEST` (400)
+- Upstream/network: `UPSTREAM_TIMEOUT` (504), `UPSTREAM_ABORTED` (502), `UPSTREAM_RATE_LIMITED` (429), `UPSTREAM_UNAVAILABLE` (503), `UPSTREAM_BAD_GATEWAY` (502), `UPSTREAM_NOT_FOUND` (404)
+- YouTube-specific: `YT_INVALID_ID` (400), `YT_LOGIN_REQUIRED` (401), `YT_AGE_RESTRICTED` (403), `YT_PRIVATE` (403), `YT_GEO_BLOCKED` (451), `YT_EMBED_BLOCKED` (451), `YT_CONTENT_CHECK_REQUIRED` (423), `YT_LIVE_STREAM_OFFLINE` (409), `YT_UNAVAILABLE` (404), `YT_PLAYABILITY_ERROR` (409), `YT_TRANSCRIPT_UNAVAILABLE` (404)
+- Fallback: `INTERNAL_ERROR` (500)
+
+Behavioral changes:
+
+- `getTranscript()` no longer returns an empty payload on errors. It throws and the router responds with a mapped error code. When a video simply has no captions, it returns `hasTranscript: false`.
+- `getVideoInfo()` and `getVideoInfoWithPoToken()` have more granular try/catch for precise logging and error propagation.
 
 
 ## Internal: WebPO token support
