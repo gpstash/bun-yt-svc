@@ -40,13 +40,20 @@ export class InnertubeService {
    */
   public async getVideoInfo(id: string, opts?: RequestOptions): Promise<ParsedVideoInfo> {
     const started = performance.now();
-    const info = await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
+    let info: YT.VideoInfo;
+    try {
+      info = await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
+        const ctx = InnertubeService.requestContext.getStore();
+        logger.debug('getVideoInfo:start', { id, requestId: ctx?.requestId });
+        const res = await this.innertube.getInfo(id);
+        logger.debug('getVideoInfo:fetched', { id, requestId: ctx?.requestId });
+        return res;
+      });
+    } catch (error) {
       const ctx = InnertubeService.requestContext.getStore();
-      logger.debug('getVideoInfo:start', { id, requestId: ctx?.requestId });
-      const res = await this.innertube.getInfo(id);
-      logger.debug('getVideoInfo:fetched', { id, requestId: ctx?.requestId });
-      return res;
-    });
+      logger.error('getVideoInfo:getInfo error', { id, requestId: ctx?.requestId, error });
+      throw error;
+    }
     const parsedVideoInfo = parseVideoInfo(info);
 
     // Remove baseUrl from captionLanguages
@@ -66,50 +73,66 @@ export class InnertubeService {
    * Retrieve transcript, optionally selecting a specific language.
    */
   public async getTranscript(id: string, language?: string, opts?: RequestOptions): Promise<ParsedTranscript> {
+    const started = performance.now();
+    // First stage: fetch video info
+    let info: YT.VideoInfo;
     try {
-      const started = performance.now();
-      const info = await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
+      info = await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
         const ctx = InnertubeService.requestContext.getStore();
         logger.debug('getTranscript:start', { id, language, requestId: ctx?.requestId });
         const res = await this.innertube.getInfo(id);
         logger.debug('getTranscript:fetched', { id, language, requestId: ctx?.requestId });
         return res;
       });
-      if (!hasCaptions(info)) {
-        return {
-          language: "",
-          transcriptLanguages: [],
+    } catch (error) {
+      const ctx = InnertubeService.requestContext.getStore();
+      logger.error('getTranscript:getInfo error', { id, language, requestId: ctx?.requestId, error });
+      throw error;
+    }
+
+    const parsedVideoInfo = parseVideoInfo(info);
+    if (!hasCaptions(info)) {
+      return {
+        ...parsedVideoInfo,
+        transcript: {
           hasTranscript: false,
+          language: "",
           segments: [],
           text: "",
-        };
-      }
+        },
+      };
+    }
 
-      let selectedTranscript: YT.TranscriptInfo = await info.getTranscript();
+    // Second stage: fetch transcript (and optionally select language)
+    let selectedTranscript: YT.TranscriptInfo;
+    try {
+      selectedTranscript = await info.getTranscript();
       if (language && Array.isArray(selectedTranscript?.languages) && selectedTranscript.languages.includes(language)) {
         try {
           selectedTranscript = await selectedTranscript.selectLanguage(language);
-        } catch (error) {
-          logger.warn('Language selection failed, fallback to default language', error);
+        } catch (errLang) {
+          // Language selection is best-effort; log and keep default transcript
+          logger.warn('Language selection failed, fallback to default language', errLang);
         }
       }
-
-      const parsed = parseTranscript(selectedTranscript);
-      const durationMs = Math.round(performance.now() - started);
-      const ctx2 = InnertubeService.requestContext.getStore();
-      logger.info('getTranscript:done', { id, language, durationMs, requestId: ctx2?.requestId, hasTranscript: parsed.hasTranscript });
-      return parsed;
     } catch (error) {
       const ctx = InnertubeService.requestContext.getStore();
-      logger.error('Error getting transcript', { id, language, requestId: ctx?.requestId, error });
-      return {
-        language: "",
-        transcriptLanguages: [],
-        hasTranscript: false,
-        segments: [],
-        text: "",
-      };
+      logger.error('getTranscript:transcript error', { id, language, requestId: ctx?.requestId, error });
+      // Ensure message contains the word "transcript" for better mapping
+      const msg = String((error as any)?.message || '');
+      if (!msg.toLowerCase().includes('transcript')) {
+        const wrapped = new Error(`Transcript fetch failed: ${msg}`);
+        (wrapped as any).name = (error as any)?.name || 'InnertubeTranscriptError';
+        throw wrapped;
+      }
+      throw error;
     }
+
+    const parsed = parseTranscript(parsedVideoInfo, selectedTranscript);
+    const durationMs = Math.round(performance.now() - started);
+    const ctx2 = InnertubeService.requestContext.getStore();
+    logger.info('getTranscript:done', { id, language, durationMs, requestId: ctx2?.requestId, hasTranscript: parsed.transcript.hasTranscript });
+    return parsed;
   }
 
   public async getVideoInfoWithPoToken(id: string, parse: true): Promise<ParsedVideoInfo>;
@@ -390,16 +413,7 @@ export class InnertubeService {
 
   public static async createInnertube(opts?: CreateInnertubeOptions): Promise<Innertube> {
     // Map our app log level to youtubei.js log level
-    const lvl = getLogLevel();
-    const map: Record<LogLevel, number> = {
-      silent: Log.Level.NONE,
-      error: Log.Level.ERROR,
-      warn: Log.Level.WARNING,
-      info: Log.Level.INFO,
-      debug: Log.Level.DEBUG,
-      verbose: Log.Level.DEBUG,
-    } as const;
-    Log.setLevel(map[lvl] ?? Log.Level.INFO);
+    Log.setLevel(Log.Level.INFO);
     const { withPlayer, location, safetyMode, clientType, generateSessionLocally } = {
       withPlayer: false,
       safetyMode: false,

@@ -39,6 +39,7 @@ export const ERROR_CODES = {
   YT_GEO_BLOCKED: 'YT_GEO_BLOCKED',
   YT_PRIVATE: 'YT_PRIVATE',
   YT_UNAVAILABLE: 'YT_UNAVAILABLE',
+  YT_TRANSCRIPT_UNAVAILABLE: 'YT_TRANSCRIPT_UNAVAILABLE',
   YT_CONTENT_CHECK_REQUIRED: 'YT_CONTENT_CHECK_REQUIRED',
   YT_LIVE_STREAM_OFFLINE: 'YT_LIVE_STREAM_OFFLINE',
   YT_EMBED_BLOCKED: 'YT_EMBED_BLOCKED',
@@ -96,6 +97,11 @@ function detectYouTubeError(err: unknown): { status: number; code: ErrorCode; me
   // General unavailability
   if (has('video unavailable') || has('this video is unavailable') || has('unplayable') || has('unavailable')) {
     return { status: 404, code: ERROR_CODES.YT_UNAVAILABLE, message: 'Video unavailable' };
+  }
+
+  // Transcript unavailable / disabled / not found
+  if ((has('transcript') || has('caption')) && (has('not available') || has('unavailable') || has('disabled') || has('not found'))) {
+    return { status: 404, code: ERROR_CODES.YT_TRANSCRIPT_UNAVAILABLE, message: 'Transcript unavailable' };
   }
   // SABRE / App restrictions (web client not allowed)
   if (has('not available on this app') || has('sabr') || has('sabre')) {

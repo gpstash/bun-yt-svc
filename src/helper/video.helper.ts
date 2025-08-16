@@ -46,12 +46,13 @@ export interface TranscriptSegment {
   end: number;
 }
 
-export interface ParsedTranscript {
-  language: string;
-  transcriptLanguages: string[];
-  hasTranscript: boolean;
-  segments: TranscriptSegment[];
-  text: string;
+export interface ParsedTranscript extends ParsedVideoInfo {
+  transcript: {
+    hasTranscript: boolean;
+    language: string;
+    segments: TranscriptSegment[];
+    text: string;
+  }
 }
 
 export type CaptionFormat = 'srv3' | 'srv2' | 'srv1' | 'vtt' | 'ttml' | 'srt';
@@ -199,7 +200,7 @@ export function hasCaptions(info: YT.VideoInfo): boolean {
   return (info?.captions?.caption_tracks ?? []).length > 0;
 }
 
-export function parseTranscript(selectedTranscript: YT.TranscriptInfo): ParsedTranscript {
+export function parseTranscript(parsedVideoInfo: ParsedVideoInfo, selectedTranscript: YT.TranscriptInfo): ParsedTranscript {
   const initialSegments = selectedTranscript?.transcript?.content?.body?.initial_segments ?? [];
   const segments: TranscriptSegment[] = [];
   const textParts: string[] = [];
@@ -223,10 +224,12 @@ export function parseTranscript(selectedTranscript: YT.TranscriptInfo): ParsedTr
   const text = textParts.join(' ');
   const hasTranscript = Boolean(segments.length > 0 || (text && text.trim().length > 0));
   return {
-    language: selectedTranscript?.selectedLanguage ?? "",
-    transcriptLanguages: Array.isArray(selectedTranscript?.languages) ? selectedTranscript.languages as string[] : [],
-    hasTranscript,
-    segments,
-    text,
+    ...parsedVideoInfo,
+    transcript: {
+      hasTranscript,
+      language: selectedTranscript?.selectedLanguage ?? "",
+      segments,
+      text,
+    },
   };
 }
