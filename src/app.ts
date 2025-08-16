@@ -4,6 +4,7 @@ import { requestLogger } from '@/middleware/logger.middleware';
 import { configMiddleware } from '@/middleware/config.middleware';
 import { v1RootRouter } from '@/router/v1/root.router';
 import type { InnertubeService } from '@/service/innertube.service';
+import type { Context } from 'hono';
 
 export interface AppVariables {
   config: AppConfig;
@@ -25,11 +26,17 @@ export function createApp(config: AppConfig) {
   // v1 route
   app.route('/v1', v1RootRouter);
 
-  app.get('/', (c) => {
+  app.get('/', (c: Context<AppSchema>) => {
     return c.json({
       message: 'OK',
       timestamp: new Date().toISOString(),
     });
+  });
+
+  // HEAD health check endpoint (use generic handler for Hono versions without app.head)
+  app.on('HEAD', '/', (c: Context<AppSchema>) => {
+    // Fast, empty response for health check probes
+    return c.body(null, 200);
   });
 
   return app;

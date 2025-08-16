@@ -253,21 +253,6 @@ export class InnertubeService {
     return url.includes('/v1/player');
   }
 
-  private static isYouTubeHost(url: string): boolean {
-    try {
-      const u = new URL(url);
-      const host = u.hostname;
-      return (
-        host.endsWith('youtube.com') ||
-        host.endsWith('googlevideo.com') ||
-        host.endsWith('ytimg.com') ||
-        host.endsWith('youtubei.googleapis.com')
-      );
-    } catch {
-      return false;
-    }
-  }
-
   private static toFetchArgs(input: RequestInfo | URL, init?: RequestInit): { url: string | URL; init?: RequestInit } {
     if (typeof input === 'string' || input instanceof URL) {
       return { url: input, init };

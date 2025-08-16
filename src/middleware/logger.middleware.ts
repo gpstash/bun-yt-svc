@@ -15,17 +15,17 @@ export function requestLogger(): MiddlewareHandler<AppSchema> {
     const url = c.req.url;
     const userAgent = c.req.header('user-agent');
 
-    logger.info('BEGIN', { id, method, url, userAgent });
+    logger.info('--- BEGIN REQUEST ---', { id, method, url, userAgent });
     try {
       await next();
     } catch (err) {
-      logger.error('ERROR', { id, method, url, error: err instanceof Error ? err.message : String(err) });
+      logger.error('--- END REQUEST::ERROR ---', { id, method, url, error: err instanceof Error ? err.message : String(err) });
       throw err;
     } finally {
       const durationMs = Date.now() - start;
       const status = c.res.status;
       const contentLength = c.res.headers.get('content-length') || undefined;
-      logger.info('END', { id, method, url, status, durationMs, contentLength });
+      logger.info('--- END REQUEST ---', { id, method, url, status, durationMs, contentLength });
     }
   };
 }
