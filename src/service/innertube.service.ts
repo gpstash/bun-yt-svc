@@ -1,6 +1,6 @@
 import { createLogger, getLogLevel, LogLevel } from "@/lib/logger.lib";
 import { ClientType, Innertube, Log, UniversalCache, YT } from "youtubei.js";
-import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedTranscript, finCaptionByLanguageCode, ParsedVideoInfoWithCaption } from "@/helper/video.helper";
+import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedVideoInfoWithTranscript, finCaptionByLanguageCode, ParsedVideoInfoWithCaption } from "@/helper/video.helper";
 import { decodeJson3Caption, buildParsedVideoInfoWithCaption } from "@/helper/caption.helper";
 import { http, HttpOptions } from "@/lib/http.lib";
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -26,6 +26,10 @@ export class InnertubeService {
   constructor(private readonly innertube: Innertube) { }
   // Per-request context to carry AbortSignal from router -> service -> innertube fetches
   private static readonly requestContext = new AsyncLocalStorage<{ signal?: AbortSignal; requestId?: string }>();
+  // Shared cache to be reused across player-enabled Innertube instances in-process
+  private static sharedCache: UniversalCache | undefined;
+  // Singleton player-enabled Innertube instance to avoid repeated player downloads
+  private static playerInnertube: Innertube | undefined;
   private static readonly DEFAULT_HTTP_OPTIONS: Readonly<HttpOptions> = {
     timeoutMs: 12000,
     maxAttempts: 3,
@@ -158,7 +162,7 @@ export class InnertubeService {
   /**
    * Retrieve transcript, optionally selecting a specific language.
    */
-  public async getTranscript(id: string, language?: string, opts?: RequestOptions): Promise<ParsedTranscript> {
+  public async getTranscript(id: string, language?: string, opts?: RequestOptions): Promise<ParsedVideoInfoWithTranscript> {
     const started = performance.now();
     // First stage: fetch video info
     let info: YT.VideoInfo;
@@ -269,7 +273,9 @@ export class InnertubeService {
   // #region getVideoInfoWithPoToken helpers
   private static async createPlayerInnertubeSafe(id: string): Promise<Innertube> {
     try {
-      return await InnertubeService.createInnertube({ withPlayer: true });
+      await InnertubeService.ensurePlayerReady();
+      // playerInnertube is guaranteed by ensurePlayerReady
+      return InnertubeService.playerInnertube as Innertube;
     } catch (error) {
       const ctx = InnertubeService.requestContext.getStore();
       logger.error('getVideoInfoWithPoToken:createInnertube error', { id, requestId: ctx?.requestId, error });
@@ -521,6 +527,8 @@ export class InnertubeService {
         ...(InnertubeService.DEFAULT_HTTP_OPTIONS.retryOnStatus ?? []),
         400,
       ] } : {}),
+      // Player endpoint is heavy (download + parse). Allow longer timeout.
+      ...(isPlayerEndpoint ? { timeoutMs: Math.max(20000, InnertubeService.DEFAULT_HTTP_OPTIONS.timeoutMs ?? 0) } : {}),
       signal: compositeSignal,
     }
 
@@ -590,7 +598,13 @@ export class InnertubeService {
     };
 
     let cache: UniversalCache | undefined;
-    if (withPlayer) cache = new UniversalCache(false);
+    if (withPlayer) {
+      // Initialize and reuse a single in-process cache for player data
+      if (!InnertubeService.sharedCache) {
+        InnertubeService.sharedCache = new UniversalCache(false);
+      }
+      cache = InnertubeService.sharedCache;
+    }
 
     // youtubei.js expects a fetch with optional `preconnect`. Provide a compatible wrapper.
     type FetchWithPreconnect = typeof fetch & { preconnect?: (url: string) => Promise<void> | void };
@@ -620,5 +634,23 @@ export class InnertubeService {
 
     logger.debug('[createInnertube] Creating Innertube instance with config:', innertubeConfig);
     return await Innertube.create(innertubeConfig);
+  }
+
+  /**
+   * Ensure a singleton player-enabled Innertube is initialized and ready.
+   * Safe to call multiple times; subsequent calls are no-ops.
+   */
+  public static async ensurePlayerReady(): Promise<void> {
+    if (InnertubeService.playerInnertube) return;
+    const started = performance.now();
+    try {
+      InnertubeService.playerInnertube = await InnertubeService.createInnertube({ withPlayer: true });
+      const elapsed = Math.round(performance.now() - started);
+      logger.info('[ensurePlayerReady] Player initialized', { durationMs: elapsed });
+    } catch (error) {
+      // Do not crash startup if player pre-warm fails; next request will retry
+      const elapsed = Math.round(performance.now() - started);
+      logger.warn('[ensurePlayerReady] Player init failed; will retry on demand', { durationMs: elapsed, error });
+    }
   }
 }
