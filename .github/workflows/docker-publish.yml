@@ -48,6 +48,7 @@ jobs:
             type=sha
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -57,3 +58,45 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Compose image reference with digest
+        id: image_ref
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest@${{ steps.build.outputs.digest }}"
+          echo "image=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout ArgoCD repo
+        uses: actions/checkout@v4
+        with:
+          repository: gpstash/argocd-gpstash-microk8s
+          token: ${{ secrets.ARGOCD_REPO_TOKEN }}
+          path: argocd-repo
+
+      - name: Update deployment image via yq
+        working-directory: argocd-repo
+        env:
+          NEW_IMAGE: ${{ steps.image_ref.outputs.image }}
+        run: |
+          sudo curl -L "https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64" -o /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+          # Update the image field for container name bun-yt-svc
+          yq -i '(.spec.template.spec.containers[] | select(.name == "bun-yt-svc").image) = env(NEW_IMAGE)' apps/bun-yt-svc/deployment.yaml
+          echo "Updated image to: ${NEW_IMAGE}"
+          git diff -- apps/bun-yt-svc/deployment.yaml || true
+
+      - name: Commit and push changes
+        if: success()
+        working-directory: argocd-repo
+        env:
+          GIT_AUTHOR_NAME: github-actions
+          GIT_AUTHOR_EMAIL: github-actions@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions
+          GIT_COMMITTER_EMAIL: github-actions@users.noreply.github.com
+        run: |
+          git add apps/bun-yt-svc/deployment.yaml
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(bun-yt-svc): update image to ${{ steps.image_ref.outputs.image }}"
+            git push origin HEAD
+          else
+            echo "No changes to commit."
+          fi
