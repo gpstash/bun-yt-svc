@@ -30,6 +30,8 @@ export class InnertubeService {
   private static sharedCache: UniversalCache | undefined;
   // Singleton player-enabled Innertube instance to avoid repeated player downloads
   private static playerInnertube: Innertube | undefined;
+  // Prevent concurrent duplicate player initializations
+  private static playerInit?: Promise<void>;
   private static readonly DEFAULT_HTTP_OPTIONS: Readonly<HttpOptions> = {
     timeoutMs: 12000,
     maxAttempts: 3,
@@ -39,6 +41,10 @@ export class InnertubeService {
     retryMethods: ['GET', 'HEAD', 'OPTIONS', 'POST'], // Innertube frequently uses POST
     respectRetryAfter: true,
   } as const;
+  // Centralized max attempts for transient playability/unavailability retries
+  private static readonly MAX_PLAYABILITY_ATTEMPTS = 3;
+  // Maximum jitter cap used in our retry backoff helper
+  private static readonly MAX_BACKOFF_JITTER_MS = 600;
 
   /**
    * Fetch and parse video information with a normalized shape safe for clients.
@@ -229,15 +235,18 @@ export class InnertubeService {
   // Centralized raw getInfo with 3 attempts when playability appears unavailable (no Po token)
   private async getVideoInfoRawWithRetries(id: string): Promise<YT.VideoInfo> {
     const ctx = InnertubeService.requestContext.getStore();
-    const maxAttempts = 3;
     let last: YT.VideoInfo | undefined;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    for (let attempt = 0; attempt < InnertubeService.MAX_PLAYABILITY_ATTEMPTS; attempt++) {
       const res = await this.innertube.getInfo(id);
       last = res;
       logger.debug('getVideoInfoRawWithRetries:fetched', { id, attempt, requestId: ctx?.requestId });
       if (!InnertubeService.isUnavailablePlayability(res)) break;
-      if (attempt < maxAttempts - 1) {
-        await InnertubeService.backoffJitter(attempt, InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100, 600);
+      if (attempt < InnertubeService.MAX_PLAYABILITY_ATTEMPTS - 1) {
+        await InnertubeService.backoffJitter(
+          attempt,
+          InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100,
+          InnertubeService.MAX_BACKOFF_JITTER_MS
+        );
         continue;
       }
     }
@@ -256,8 +265,7 @@ export class InnertubeService {
 
       // Attempt up to 3 times if playability reports "unavailable"
       let info!: YT.VideoInfo;
-      const maxAttempts = 3;
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      for (let attempt = 0; attempt < InnertubeService.MAX_PLAYABILITY_ATTEMPTS; attempt++) {
         try {
           info = await InnertubeService.getWebInfoSafe(webInnertube, id, contentPoToken);
         } catch (e) {
@@ -267,8 +275,12 @@ export class InnertubeService {
             info = mwebOnError;
             clientName = 'MWEB';
           } else {
-            if (attempt >= maxAttempts - 1) throw e;
-            await InnertubeService.backoffJitter(attempt, InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100, 600);
+            if (attempt >= InnertubeService.MAX_PLAYABILITY_ATTEMPTS - 1) throw e;
+            await InnertubeService.backoffJitter(
+              attempt,
+              InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100,
+              InnertubeService.MAX_BACKOFF_JITTER_MS
+            );
             continue;
           }
         }
@@ -277,8 +289,12 @@ export class InnertubeService {
           break;
         }
         // If unavailable and not the last attempt, sleep and retry
-        if (attempt < maxAttempts - 1) {
-          await InnertubeService.backoffJitter(attempt, InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100, 600);
+        if (attempt < InnertubeService.MAX_PLAYABILITY_ATTEMPTS - 1) {
+          await InnertubeService.backoffJitter(
+            attempt,
+            InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100,
+            InnertubeService.MAX_BACKOFF_JITTER_MS
+          );
           continue;
         }
         // Out of attempts; proceed with current info (unavailable)
@@ -588,19 +604,22 @@ export class InnertubeService {
 
     // Fast-path: use native fetch directly for non-player endpoints without proxy needs,
     // except transcript endpoint which benefits from our retry logic
-    const isTranscriptEndpoint = InnertubeService.isTranscriptEndpoint(targetUrl);
-    if (!isPlayerEndpoint && !isProxyEnabled && !isTranscriptEndpoint) {
+    const isTranscript = InnertubeService.isTranscriptEndpoint(targetUrl);
+    if (!isPlayerEndpoint && !isProxyEnabled && !isTranscript) {
       // Combine context signal and any init.signal
       const { signal, cleanup } = InnertubeService.linkAbortSignals([ctx?.signal, (writableInit?.signal as AbortSignal | undefined)]);
-      const res = await fetch(url as any, { ...(writableInit || {}), signal } as RequestInit);
-      logger.verbose('innertubeFetch native', {
-        url: String(url),
-        status: res.status,
-        durationMs: Math.round(performance.now() - start),
-        requestId: ctx?.requestId,
-      });
-      cleanup();
-      return res;
+      try {
+        const res = await fetch(url as any, { ...(writableInit || {}), signal } as RequestInit);
+        logger.verbose('innertubeFetch native', {
+          url: String(url),
+          status: res.status,
+          durationMs: Math.round(performance.now() - start),
+          requestId: ctx?.requestId,
+        });
+        return res;
+      } finally {
+        cleanup();
+      }
     }
 
     // Combine context and init signals for http(); stop retries on abort
@@ -613,7 +632,7 @@ export class InnertubeService {
       ...InnertubeService.DEFAULT_HTTP_OPTIONS,
       ...(isProxyNeeded ? { useProxy: true } : {}),
       // Extend retry behavior for transcript endpoint to also retry on 400 FAILED_PRECONDITION
-      ...(isTranscriptEndpoint ? { retryOnStatus: [
+      ...(isTranscript ? { retryOnStatus: [
         ...(InnertubeService.DEFAULT_HTTP_OPTIONS.retryOnStatus ?? []),
         400,
       ] } : {}),
@@ -732,15 +751,25 @@ export class InnertubeService {
    */
   public static async ensurePlayerReady(): Promise<void> {
     if (InnertubeService.playerInnertube) return;
-    const started = performance.now();
-    try {
-      InnertubeService.playerInnertube = await InnertubeService.createInnertube({ withPlayer: true });
-      const elapsed = Math.round(performance.now() - started);
-      logger.info('[ensurePlayerReady] Player initialized', { durationMs: elapsed });
-    } catch (error) {
-      // Do not crash startup if player pre-warm fails; next request will retry
-      const elapsed = Math.round(performance.now() - started);
-      logger.warn('[ensurePlayerReady] Player init failed; will retry on demand', { durationMs: elapsed, error });
+    if (InnertubeService.playerInit) {
+      // Another caller is initializing; await it.
+      await InnertubeService.playerInit;
+      return;
     }
+    const started = performance.now();
+    InnertubeService.playerInit = (async () => {
+      try {
+        InnertubeService.playerInnertube = await InnertubeService.createInnertube({ withPlayer: true });
+        const elapsed = Math.round(performance.now() - started);
+        logger.info('[ensurePlayerReady] Player initialized', { durationMs: elapsed });
+      } catch (error) {
+        // Do not crash startup if player pre-warm fails; next request will retry
+        const elapsed = Math.round(performance.now() - started);
+        logger.warn('[ensurePlayerReady] Player init failed; will retry on demand', { durationMs: elapsed, error });
+      } finally {
+        InnertubeService.playerInit = undefined;
+      }
+    })();
+    await InnertubeService.playerInit;
   }
 }
