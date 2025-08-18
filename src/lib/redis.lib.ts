@@ -16,10 +16,32 @@ function createClient(): Redis | undefined {
     lazyConnect: true,
     maxRetriesPerRequest: 3,
     enableOfflineQueue: true,
+    connectTimeout: 10000,
+    lazyConnectTimeout: 10000,
+    keepAlive: 30000,
+    family: 0, // Allow both IPv4 and IPv6
+    dns: {
+      lookup: require('dns').lookup,
+    },
+    retryDelayOnFailover: 100,
+    retryDelayOnClusterDown: 300,
   });
-  redis.on('error', (err) => logger.error('Redis error', err));
-  redis.on('connect', () => logger.info('Redis connected'));
-  redis.on('reconnecting', () => logger.warn('Redis reconnecting...'));
+  // Build a safe URL for logs (mask password)
+  const safeUrl = (() => {
+    try {
+      const u = new URL(REDIS_URL);
+      if (u.password) u.password = '***';
+      return u.toString();
+    } catch {
+      return REDIS_URL.replace(/:[^@]*@/, ':***@');
+    }
+  })();
+
+  logger.info('Redis configured', { url: safeUrl });
+
+  redis.on('error', (err) => logger.error('Redis error', { url: safeUrl, err }));
+  redis.on('connect', () => logger.info('Redis connected', { url: safeUrl }));
+  redis.on('reconnecting', () => logger.warn('Redis reconnecting...', { url: safeUrl }));
   return redis;
 }
 
