@@ -45,12 +45,12 @@ export class InnertubeService {
    */
   public async getVideoInfo(id: string, opts?: RequestOptions): Promise<ParsedVideoInfo> {
     const started = performance.now();
-    let info: YT.VideoInfo;
+    let info!: YT.VideoInfo;
     try {
       info = await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
         const ctx = InnertubeService.requestContext.getStore();
         logger.debug('getVideoInfo:start', { id, requestId: ctx?.requestId });
-        const res = await this.innertube.getInfo(id);
+        const res = await this.getVideoInfoRawWithRetries(id);
         logger.debug('getVideoInfo:fetched', { id, requestId: ctx?.requestId });
         return res;
       });
@@ -170,7 +170,8 @@ export class InnertubeService {
       info = await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
         const ctx = InnertubeService.requestContext.getStore();
         logger.debug('getTranscript:start', { id, language, requestId: ctx?.requestId });
-        const res = await this.innertube.getInfo(id);
+        // Reuse resilient raw info (no Po token) with unavailable retries
+        const res = await this.getVideoInfoRawWithRetries(id);
         logger.debug('getTranscript:fetched', { id, language, requestId: ctx?.requestId });
         return res;
       });
@@ -225,6 +226,24 @@ export class InnertubeService {
     return parsed;
   }
 
+  // Centralized raw getInfo with 3 attempts when playability appears unavailable (no Po token)
+  private async getVideoInfoRawWithRetries(id: string): Promise<YT.VideoInfo> {
+    const ctx = InnertubeService.requestContext.getStore();
+    const maxAttempts = 3;
+    let last: YT.VideoInfo | undefined;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const res = await this.innertube.getInfo(id);
+      last = res;
+      logger.debug('getVideoInfoRawWithRetries:fetched', { id, attempt, requestId: ctx?.requestId });
+      if (!InnertubeService.isUnavailablePlayability(res)) break;
+      if (attempt < maxAttempts - 1) {
+        await InnertubeService.backoffJitter(attempt, InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100, 600);
+        continue;
+      }
+    }
+    return last as YT.VideoInfo;
+  }
+
   public async getVideoInfoWithPoToken(id: string, parse: true, opts?: RequestOptions): Promise<ParsedVideoInfo>;
   public async getVideoInfoWithPoToken(id: string, parse: false, opts?: RequestOptions): Promise<YT.VideoInfo>;
   public async getVideoInfoWithPoToken(id: string, parse: boolean, opts?: RequestOptions): Promise<YT.VideoInfo | ParsedVideoInfo> {
@@ -235,7 +254,36 @@ export class InnertubeService {
       const visitorData = InnertubeService.assertVisitorData(webInnertube);
       const { contentPoToken, sessionPoToken } = await InnertubeService.mintPoTokensSafe(id, visitorData);
 
-      let info = await InnertubeService.getWebInfoSafe(webInnertube, id, contentPoToken);
+      // Attempt up to 3 times if playability reports "unavailable"
+      let info!: YT.VideoInfo;
+      const maxAttempts = 3;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          info = await InnertubeService.getWebInfoSafe(webInnertube, id, contentPoToken);
+        } catch (e) {
+          // On direct WEB failure, try MWEB once for this attempt
+          const mwebOnError = await InnertubeService.getMwebInfoBestEffort(webInnertube, id, contentPoToken);
+          if (mwebOnError) {
+            info = mwebOnError;
+            clientName = 'MWEB';
+          } else {
+            if (attempt >= maxAttempts - 1) throw e;
+            await InnertubeService.backoffJitter(attempt, InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100, 600);
+            continue;
+          }
+        }
+
+        if (!InnertubeService.isUnavailablePlayability(info)) {
+          break;
+        }
+        // If unavailable and not the last attempt, sleep and retry
+        if (attempt < maxAttempts - 1) {
+          await InnertubeService.backoffJitter(attempt, InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100, 600);
+          continue;
+        }
+        // Out of attempts; proceed with current info (unavailable)
+        break;
+      }
 
       // SABR-only workaround via MWEB
       const mwebInfo = await InnertubeService.getMwebInfoBestEffort(webInnertube, id, contentPoToken);
@@ -338,6 +386,48 @@ export class InnertubeService {
   private static isUnplayableOrLoginRequired(info: YT.VideoInfo, hasTrailer: boolean, trailerIsAgeRestricted: boolean): boolean {
     const status = info?.playability_status?.status;
     return (status === 'UNPLAYABLE' && (!hasTrailer || trailerIsAgeRestricted)) || status === 'LOGIN_REQUIRED';
+  }
+
+  // Detect common "unavailable" playability states that may be transient
+  private static isUnavailablePlayability(info: YT.VideoInfo): boolean {
+    const status = info?.playability_status?.status as string | undefined;
+    const reason = String((info as any)?.playability_status?.reason ?? '').toLowerCase();
+    const embeddable = (info as any)?.playability_status?.embeddable;
+    return (
+      status === 'ERROR' ||
+      status === 'UNPLAYABLE' ||
+      status === 'LOGIN_REQUIRED' ||
+      reason.includes('unavailable') ||
+      embeddable === false
+    );
+  }
+
+  // Abort-aware jittered exponential backoff sleep
+  private static async backoffJitter(attempt: number, baseMs: number, maxMs: number): Promise<void> {
+    const max = Math.min(baseMs * 2 ** attempt, maxMs);
+    const delay = Math.floor(Math.random() * Math.max(1, max));
+    const ctx = InnertubeService.requestContext.getStore();
+    const { signal, cleanup } = InnertubeService.linkAbortSignals([ctx?.signal]);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          cleanupTimer();
+          resolve();
+        }, delay);
+        const onAbort = () => {
+          cleanupTimer();
+          const e = Object.assign(new Error('Aborted during retry backoff'), { name: 'AbortError' });
+          reject(e);
+        };
+        const cleanupTimer = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+      });
+    } finally {
+      cleanup();
+    }
   }
 
   private static async tryWebEmbeddedBypassBestEffort(webInnertube: Innertube, info: YT.VideoInfo, id: string, po: string): Promise<{ updated: boolean; clientName?: string; hasTrailer: boolean; trailerIsAgeRestricted: boolean; } | undefined> {
