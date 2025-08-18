@@ -3,6 +3,7 @@ import { HttpError } from '@/lib/http.lib';
 import { Context, Hono } from 'hono';
 import type { AppSchema } from '@/app';
 import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODES } from '@/lib/hono.util';
+import { z } from 'zod';
 
 export const v1InnertubeVideoRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:video');
@@ -10,13 +11,21 @@ logger.debug('Initializing /v1/innertube/video router');
 
 v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
   const rawId = c.req.query('v');
-  const videoId = rawId?.trim();
   const requestId = c.get('requestId');
 
-  if (!videoId) {
-    logger.warn('Missing required query parameter', { param: 'v', requestId });
-    return c.json({ error: 'Missing video id', code: ERROR_CODES.BAD_REQUEST }, 400);
+  const QuerySchema = z.object({
+    v: z.string().trim().min(1, 'Missing video id'),
+  });
+
+  const parsed = QuerySchema.safeParse({ v: rawId });
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    const msg = first.message || 'Bad Request';
+    logger.warn('Invalid query parameters for /v1/innertube/video', { issues: parsed.error.issues, requestId });
+    return c.json({ error: msg, code: ERROR_CODES.BAD_REQUEST }, 400);
   }
+
+  const videoId = parsed.data.v;
 
   try {
     const info = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
@@ -33,4 +42,5 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
     return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
   }
 });
+
 
