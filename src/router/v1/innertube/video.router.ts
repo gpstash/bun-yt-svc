@@ -4,7 +4,7 @@ import { Context, Hono } from 'hono';
 import type { AppSchema } from '@/app';
 import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODES } from '@/lib/hono.util';
 import { z } from 'zod';
-import { upsertVideo } from '@/service/video.service';
+import { upsertVideo, getVideoById } from '@/service/video.service';
 import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
 
 export const v1InnertubeVideoRouter = new Hono<AppSchema>();
@@ -39,7 +39,34 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
       return c.json(cached);
     }
 
-    logger.info('Cache miss for video, fetching', { videoId, requestId });
+    // Cache miss: consult DB
+    try {
+      const dbRes = await getVideoById(videoId);
+      if (dbRes) {
+        const now = Date.now();
+        const updatedAtMs = new Date(dbRes.updatedAt).getTime();
+        const ageSeconds = Math.max(0, Math.floor((now - updatedAtMs) / 1000));
+        if (ageSeconds < ttlSeconds) {
+          const remaining = Math.max(1, ttlSeconds - ageSeconds);
+          // Warm cache with remaining TTL (non-fatal)
+          try {
+            await redisSetJson(cacheKey, dbRes.video, remaining);
+            logger.debug('Video cached from DB', { videoId, remaining, requestId });
+          } catch (cacheErrDb) {
+            logger.error('Video caching from DB failed', { videoId, requestId, error: cacheErrDb });
+          }
+          logger.info('DB hit within TTL for video', { videoId, ageSeconds, remaining, requestId });
+          return c.json(dbRes.video);
+        }
+        logger.info('DB hit but stale; will fetch YouTube', { videoId, ageSeconds, ttlSeconds, requestId });
+      } else {
+        logger.debug('DB miss for video', { videoId, requestId });
+      }
+    } catch (dbErr) {
+      logger.error('DB check failed; continuing to fetch from YouTube', { videoId, requestId, error: dbErr });
+    }
+
+    logger.info('Cache miss for video, fetching from YouTube', { videoId, requestId });
     const info = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
 
     // Persist video info (non-fatal if it fails)

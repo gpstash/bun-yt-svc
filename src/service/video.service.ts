@@ -2,6 +2,7 @@ import { db } from '@/db/client';
 import { videos } from '@/db/schema';
 import type { ParsedVideoInfo } from '@/helper/video.helper';
 import { createLogger } from '@/lib/logger.lib';
+import { eq } from 'drizzle-orm';
 
 const logger = createLogger('service:video');
 
@@ -74,4 +75,46 @@ export async function upsertVideo(parsed: ParsedVideoInfo) {
     });
 
   return { upserted: true } as const;
+}
+
+type VideoRow = typeof videos.$inferSelect;
+
+function mapRowToParsed(row: VideoRow): ParsedVideoInfo {
+  return {
+    id: row.id,
+    title: row.title,
+    author: row.author,
+    description: row.description,
+    thumbnails: row.thumbnails,
+    category: row.category,
+    tags: row.tags,
+    duration: row.duration,
+    channel: row.channel,
+    viewCount: row.viewCount as number,
+    likeCount: row.likeCount as number,
+    isPrivate: row.isPrivate,
+    isUnlisted: row.isUnlisted,
+    isFamilySafe: row.isFamilySafe,
+    publishDate: {
+      raw: row.publishDateRaw,
+      formatted: row.publishDateFormatted,
+    },
+    transcriptLanguages: row.transcriptLanguages,
+    hasTranscripts: row.hasTranscripts,
+    captionLanguages: row.captionLanguages,
+    hasCaptions: row.hasCaptions,
+    captionTranslationLanguages: row.captionTranslationLanguages,
+  } as ParsedVideoInfo;
+}
+
+export async function getVideoById(id: string): Promise<{ video: ParsedVideoInfo; updatedAt: Date } | null> {
+  if (!db) {
+    logger.warn('DB is not initialized. Skipping getVideoById', { id });
+    return null;
+  }
+  const rows = await db.select().from(videos).where(eq(videos.id, id)).limit(1);
+  const row = rows[0];
+  if (!row) return null;
+  const parsed = mapRowToParsed(row as VideoRow);
+  return { video: parsed, updatedAt: row.updatedAt };
 }
