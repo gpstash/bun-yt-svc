@@ -2,7 +2,7 @@
   "name": "bun-yt-svc",
   "scripts": {
     "dev": "bun run --hot src/index.ts",
-    "build": "bun build --target=bun --minify --sourcemap --outdir=dist src/index.ts",
+    "build": "bun build --target=bun --minify --sourcemap --outdir=dist --external=canvas src/index.ts",
     "start": "bun run dist/index.js"
   },
   "dependencies": {
