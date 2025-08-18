@@ -4,6 +4,8 @@ import { Context, Hono } from 'hono';
 import type { AppSchema } from '@/app';
 import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODES } from '@/lib/hono.util';
 import { z } from 'zod';
+import { upsertVideo } from '@/service/video.service';
+import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
 
 export const v1InnertubeVideoRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:video');
@@ -26,9 +28,36 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
   }
 
   const videoId = parsed.data.v;
+  const cacheKey = `yt:video:${videoId}`;
+  const ttlSeconds = c.get('config').VIDEO_CACHE_TTL_SECONDS;
 
   try {
+    // Attempt cache read first
+    const cached = await redisGetJson<any>(cacheKey);
+    if (cached) {
+      logger.info('Cache hit for video', { videoId, requestId });
+      return c.json(cached);
+    }
+
+    logger.info('Cache miss for video, fetching', { videoId, requestId });
     const info = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
+
+    // Persist video info (non-fatal if it fails)
+    try {
+      const res = await upsertVideo(info);
+      logger.info('Video upsert completed', { videoId, upserted: res.upserted, requestId });
+    } catch (persistErr) {
+      logger.error('Video upsert failed', { videoId, requestId, error: persistErr });
+    }
+
+    // Cache the result (non-fatal)
+    try {
+      await redisSetJson(cacheKey, info, ttlSeconds);
+      logger.debug('Video cached', { videoId, ttlSeconds, requestId });
+    } catch (cacheErr) {
+      logger.error('Video caching failed', { videoId, requestId, error: cacheErr });
+    }
+
     return c.json(info);
   } catch (err) {
     // Map client aborts to 499 (Client Closed Request). Hono doesn't have 499; use numeric.

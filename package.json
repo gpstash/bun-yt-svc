@@ -13,6 +13,7 @@
     "date-fns": "^4.1.0",
     "drizzle-orm": "^0.44.4",
     "hono": "^4.9.1",
+    "ioredis": "^5.7.0",
     "jsdom": "^26.1.0",
     "postgres": "^3.4.7",
     "protobufjs": "^7.5.3",
