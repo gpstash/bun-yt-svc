@@ -1,5 +1,8 @@
 import type { YT } from "youtubei.js";
 import { parse, isValid } from "date-fns";
+import { createLogger } from "@/lib/logger.lib";
+
+const logger = createLogger('helper:video');
 
 export interface Thumbnail {
   url: string;
@@ -18,6 +21,7 @@ export interface Caption {
 export interface ParsedVideoInfo {
   id: string;
   title: string;
+  author: string;
   description: string;
   thumbnails: Thumbnail[];
   category: string;
@@ -30,6 +34,9 @@ export interface ParsedVideoInfo {
   };
   viewCount: number;
   likeCount: number;
+  isPrivate: boolean;
+  isUnlisted: boolean;
+  isFamilySafe: boolean;
   publishDate: {
     raw: string;
     formatted: string;
@@ -38,6 +45,20 @@ export interface ParsedVideoInfo {
   hasTranscripts: boolean;
   captionLanguages: Caption[];
   hasCaptions: boolean;
+  captionTranslationLanguages: {
+    languageCode: string;
+    name: string;
+  }[];
+}
+
+export interface ParsedVideoInfoWithCaption extends ParsedVideoInfo {
+  caption: {
+    hascaption: boolean;
+    language: string;
+    segments: TranscriptSegment[];
+    words: TranscriptSegment[];
+    text: string;
+  }
 }
 
 export interface TranscriptSegment {
@@ -46,7 +67,7 @@ export interface TranscriptSegment {
   end: number;
 }
 
-export interface ParsedTranscript extends ParsedVideoInfo {
+export interface ParsedVideoInfoWithTranscript extends ParsedVideoInfo {
   transcript: {
     hasTranscript: boolean;
     language: string;
@@ -72,13 +93,11 @@ function generateThumbnails(videoId: string): Thumbnail[] {
 
 export function parseVideoInfo(info: YT.VideoInfo): ParsedVideoInfo {
   const tracks = info?.captions?.caption_tracks ?? [];
-  const hasTranscripts: boolean = tracks.length > 0;
-  const hasCaptions: boolean = tracks.length > 0;
-
 
   return {
     id: info?.basic_info?.id ?? "",
     title: info?.basic_info?.title ?? "",
+    author: info?.basic_info?.author ?? "",
     description: info?.basic_info?.short_description ?? "",
     thumbnails: generateThumbnails(info?.basic_info?.id ?? ""),
     category: info?.basic_info?.category ?? "",
@@ -91,12 +110,16 @@ export function parseVideoInfo(info: YT.VideoInfo): ParsedVideoInfo {
     },
     viewCount: info?.basic_info?.view_count ?? 0,
     likeCount: info?.basic_info?.like_count ?? 0,
+    isPrivate: info?.basic_info?.is_private ?? false,
+    isUnlisted: info?.basic_info?.is_unlisted ?? false,
+    isFamilySafe: info?.basic_info?.is_family_safe ?? false,
     publishDate: {
       raw: info.primary_info?.published?.text ?? "",
       formatted: info.primary_info?.published?.text ? getPublishDate(info.primary_info.published.text) : "",
     },
+    hasTranscripts: tracks.length > 0,
     transcriptLanguages: tracks.map((track) => track?.name?.text ?? ""),
-    hasTranscripts,
+    hasCaptions: tracks.length > 0,
     captionLanguages: tracks.map((track) => ({
       name: track?.name?.text ?? "",
       languageCode: track?.language_code ?? "",
@@ -104,8 +127,11 @@ export function parseVideoInfo(info: YT.VideoInfo): ParsedVideoInfo {
       isTranslatable: track?.is_translatable ?? false,
       baseUrl: track?.base_url,
     })) ?? [],
-    hasCaptions,
-  }
+    captionTranslationLanguages: (info?.captions?.translation_languages ?? []).map((tLang) => ({
+      name: tLang.language_name.text ?? tLang.language_code,
+      languageCode: tLang.language_code,
+    })),
+  };
 }
 
 export function getPublishDate(dateStr: string): string {
@@ -200,7 +226,7 @@ export function hasCaptions(info: YT.VideoInfo): boolean {
   return (info?.captions?.caption_tracks ?? []).length > 0;
 }
 
-export function parseTranscript(parsedVideoInfo: ParsedVideoInfo, selectedTranscript: YT.TranscriptInfo): ParsedTranscript {
+export function parseTranscript(parsedVideoInfo: ParsedVideoInfo, selectedTranscript: YT.TranscriptInfo): ParsedVideoInfoWithTranscript {
   const initialSegments = selectedTranscript?.transcript?.content?.body?.initial_segments ?? [];
   const segments: TranscriptSegment[] = [];
   const textParts: string[] = [];
@@ -223,6 +249,13 @@ export function parseTranscript(parsedVideoInfo: ParsedVideoInfo, selectedTransc
 
   const text = textParts.join(' ');
   const hasTranscript = Boolean(segments.length > 0 || (text && text.trim().length > 0));
+  // Remove transcript baseUrl from base
+  parsedVideoInfo.captionLanguages = parsedVideoInfo.captionLanguages.map((language) => {
+    return {
+      ...language,
+      baseUrl: undefined,
+    };
+  });
   return {
     ...parsedVideoInfo,
     transcript: {
@@ -232,4 +265,15 @@ export function parseTranscript(parsedVideoInfo: ParsedVideoInfo, selectedTransc
       text,
     },
   };
+}
+
+export function finCaptionByLanguageCode(captions: Caption[], languageCode: string = "en"): Caption {
+  logger.debug('finCaptionByLanguageCode', { languageCode });
+  const caption = captions.find((caption) => caption.languageCode.toLowerCase() === languageCode.toLowerCase());
+  if (caption) {
+    logger.debug('finCaptionByLanguageCode: found', { caption });
+    return caption;
+  }
+  logger.debug('finCaptionByLanguageCode: not found, using first caption', { caption: captions[0] });
+  return captions[0];
 }

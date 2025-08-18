@@ -25,6 +25,10 @@ export const ERROR_CODES = {
   CLIENT_CLOSED_REQUEST: 'CLIENT_CLOSED_REQUEST',
   BAD_REQUEST: 'BAD_REQUEST',
 
+  // Validation
+  INVALID_LANGUAGE: 'INVALID_LANGUAGE',
+  INVALID_TRANSLATE_LANGUAGE: 'INVALID_TRANSLATE_LANGUAGE',
+
   // Upstream/Network
   UPSTREAM_TIMEOUT: 'UPSTREAM_TIMEOUT',
   UPSTREAM_ABORTED: 'UPSTREAM_ABORTED',
@@ -45,6 +49,8 @@ export const ERROR_CODES = {
   YT_EMBED_BLOCKED: 'YT_EMBED_BLOCKED',
   YT_INVALID_ID: 'YT_INVALID_ID',
   YT_PLAYABILITY_ERROR: 'YT_PLAYABILITY_ERROR',
+  YT_TRANSLATION_UNSUPPORTED: 'YT_TRANSLATION_UNSUPPORTED',
+  YT_TRANSLATION_SAME_LANGUAGE: 'YT_TRANSLATION_SAME_LANGUAGE',
 
   // Generic
   INTERNAL_ERROR: 'INTERNAL_ERROR',
@@ -102,6 +108,19 @@ function detectYouTubeError(err: unknown): { status: number; code: ErrorCode; me
   // Transcript unavailable / disabled / not found
   if ((has('transcript') || has('caption')) && (has('not available') || has('unavailable') || has('disabled') || has('not found'))) {
     return { status: 404, code: ERROR_CODES.YT_TRANSCRIPT_UNAVAILABLE, message: 'Transcript unavailable' };
+  }
+  // Our app-level validation & translation errors
+  if (has('invalid language')) {
+    return { status: 400, code: ERROR_CODES.INVALID_LANGUAGE, message: 'Invalid language' };
+  }
+  if (has('invalid translate language')) {
+    return { status: 400, code: ERROR_CODES.INVALID_TRANSLATE_LANGUAGE, message: 'Invalid translate language' };
+  }
+  if (has('translation unsupported') || has('not translatable')) {
+    return { status: 400, code: ERROR_CODES.YT_TRANSLATION_UNSUPPORTED, message: 'Translation unsupported for selected language' };
+  }
+  if (has('same language') && has('translate')) {
+    return { status: 400, code: ERROR_CODES.YT_TRANSLATION_SAME_LANGUAGE, message: 'Translate language must differ from source' };
   }
   // SABRE / App restrictions (web client not allowed)
   if (has('not available on this app') || has('sabr') || has('sabre')) {

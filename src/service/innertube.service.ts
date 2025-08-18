@@ -1,6 +1,7 @@
 import { createLogger, getLogLevel, LogLevel } from "@/lib/logger.lib";
 import { ClientType, Innertube, Log, UniversalCache, YT } from "youtubei.js";
-import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedTranscript } from "@/helper/video.helper";
+import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedTranscript, finCaptionByLanguageCode, ParsedVideoInfoWithCaption } from "@/helper/video.helper";
+import { decodeJson3Caption, buildParsedVideoInfoWithCaption } from "@/helper/caption.helper";
 import { http, HttpOptions } from "@/lib/http.lib";
 import { AsyncLocalStorage } from 'node:async_hooks';
 
@@ -69,6 +70,91 @@ export class InnertubeService {
     return parsedVideoInfo;
   }
 
+  public async getCaption(id: string, language?: string, translateLanguage?: string, opts?: RequestOptions): Promise<ParsedVideoInfoWithCaption> {
+    const started = performance.now();
+
+    // First stage: fetch video info
+    let info: YT.VideoInfo;
+    try {
+      info = await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
+        const ctx = InnertubeService.requestContext.getStore();
+        logger.debug('getCaption:start', { id, language, requestId: ctx?.requestId });
+        const res = await this.getVideoInfoWithPoToken(id, false, { signal: opts?.signal, requestId: opts?.requestId });
+        logger.debug('getCaption:fetched', { id, language, requestId: ctx?.requestId });
+        return res;
+      });
+    } catch (error) {
+      const ctx = InnertubeService.requestContext.getStore();
+      logger.error('getCaption:getInfo error', { id, language, requestId: ctx?.requestId, error });
+      throw error;
+    }
+
+    const parsedVideoInfo = parseVideoInfo(info);
+    if (!hasCaptions(info)) {
+      return {
+        ...parsedVideoInfo,
+        caption: {
+          hascaption: false,
+          language: "",
+          segments: [],
+          words: [],
+          text: "",
+        },
+      };
+    }
+
+    // Second stage: fetch caption
+    try {
+      const selectedCaption = finCaptionByLanguageCode(parsedVideoInfo.captionLanguages, language);
+
+      // Check if translate language is provided
+      if (translateLanguage) {
+        // Ensure source caption has baseUrl
+        if (!selectedCaption.baseUrl) {
+          throw new Error('Transcript unavailable: missing caption base URL');
+        }
+        // Ensure this caption is translatable
+        if (!selectedCaption.isTranslatable) {
+          throw Object.assign(new Error('Translation unsupported for selected language'), { name: 'ValidationError' });
+        }
+        // Ensure requested translateLanguage is available in the video's translation languages
+        const availableTl = (parsedVideoInfo.captionTranslationLanguages || []).some(
+          tl => tl.languageCode?.toLowerCase() === translateLanguage.toLowerCase()
+        );
+        if (!availableTl) {
+          throw Object.assign(new Error('Invalid translate language: not available'), { name: 'ValidationError' });
+        }
+        // Ensure target language differs from source
+        if (selectedCaption.languageCode?.toLowerCase() === translateLanguage.toLowerCase()) {
+          throw Object.assign(new Error('Translate language must differ from source'), { name: 'ValidationError' });
+        }
+      }
+
+      // Build timedtext URL; add `tlang` when translation requested
+      let timedtextUrl = selectedCaption.baseUrl!;
+      if (translateLanguage) {
+        const u = new URL(timedtextUrl);
+        u.searchParams.set('tlang', translateLanguage);
+        // Ensure json3 format remains
+        u.searchParams.set('fmt', 'json3');
+        timedtextUrl = u.toString();
+      }
+
+      const response = await http(timedtextUrl, {
+        signal: opts?.signal,
+      });
+      const text = await response.text();
+      const decoded = decodeJson3Caption(text);
+      const result = buildParsedVideoInfoWithCaption(parsedVideoInfo, decoded, selectedCaption.languageCode);
+      return result;
+
+    } catch (error) {
+      const ctx = InnertubeService.requestContext.getStore();
+      logger.error('getCaption:caption error', { id, language, requestId: ctx?.requestId, error });
+      throw error;
+    }
+  }
+
   /**
    * Retrieve transcript, optionally selecting a specific language.
    */
@@ -135,150 +221,191 @@ export class InnertubeService {
     return parsed;
   }
 
-  public async getVideoInfoWithPoToken(id: string, parse: true): Promise<ParsedVideoInfo>;
-  public async getVideoInfoWithPoToken(id: string, parse: false): Promise<YT.VideoInfo>;
-  public async getVideoInfoWithPoToken(id: string, parse: boolean): Promise<YT.VideoInfo | ParsedVideoInfo> {
-    // Lazy import to avoid loading heavy deps (e.g., jsdom) during cold start
-    const { generatePoToken } = await import("@/lib/pot.lib");
-    let contentPoToken: string, sessionPoToken: string;
-    let webInnertube: Innertube;
-    const ctx = InnertubeService.requestContext.getStore();
+  public async getVideoInfoWithPoToken(id: string, parse: true, opts?: RequestOptions): Promise<ParsedVideoInfo>;
+  public async getVideoInfoWithPoToken(id: string, parse: false, opts?: RequestOptions): Promise<YT.VideoInfo>;
+  public async getVideoInfoWithPoToken(id: string, parse: boolean, opts?: RequestOptions): Promise<YT.VideoInfo | ParsedVideoInfo> {
+    return await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
+      const webInnertube = await InnertubeService.createPlayerInnertubeSafe(id);
+      let clientName = webInnertube.session.context.client.clientName;
+
+      const visitorData = InnertubeService.assertVisitorData(webInnertube);
+      const { contentPoToken, sessionPoToken } = await InnertubeService.mintPoTokensSafe(id, visitorData);
+
+      let info = await InnertubeService.getWebInfoSafe(webInnertube, id, contentPoToken);
+
+      // SABR-only workaround via MWEB
+      const mwebInfo = await InnertubeService.getMwebInfoBestEffort(webInnertube, id, contentPoToken);
+      if (mwebInfo?.playability_status?.status === 'OK' && mwebInfo?.streaming_data) {
+        InnertubeService.mergeInfoFromMweb(info, mwebInfo);
+        clientName = 'MWEB';
+      }
+
+      let hasTrailer = info.has_trailer;
+      let trailerIsAgeRestricted = info.getTrailerInfo() === null;
+
+      if (InnertubeService.needsAgeBypass(info, hasTrailer, trailerIsAgeRestricted)) {
+        const bypass = await InnertubeService.tryWebEmbeddedBypassBestEffort(webInnertube, info, id, contentPoToken);
+        if (bypass?.updated) {
+          ({ hasTrailer, trailerIsAgeRestricted } = bypass);
+          clientName = bypass.clientName ?? clientName;
+        }
+      }
+
+      if (InnertubeService.isUnplayableOrLoginRequired(info, hasTrailer, trailerIsAgeRestricted)) {
+        return parse ? parseVideoInfo(info) : info;
+      }
+
+      if (hasTrailer && info?.playability_status?.status !== 'OK') {
+        InnertubeService.applyTrailerInfo(info);
+      }
+
+      InnertubeService.augmentStreamingDataWithSessionPot(info, sessionPoToken);
+      InnertubeService.augmentCaptionsWithPot(info, contentPoToken, clientName);
+
+      return parse ? parseVideoInfo(info) : info;
+    });
+  }
+
+  // #region getVideoInfoWithPoToken helpers
+  private static async createPlayerInnertubeSafe(id: string): Promise<Innertube> {
     try {
-      webInnertube = await InnertubeService.createInnertube({ withPlayer: true });
+      return await InnertubeService.createInnertube({ withPlayer: true });
     } catch (error) {
+      const ctx = InnertubeService.requestContext.getStore();
       logger.error('getVideoInfoWithPoToken:createInnertube error', { id, requestId: ctx?.requestId, error });
       throw error;
     }
-    let clientName = webInnertube.session.context.client.clientName;
+  }
 
-    const visitorData = webInnertube.session.context.client.visitorData;
-    if (!visitorData) {
-      throw new Error('Missing visitorData in Innertube session context');
-    }
+  private static assertVisitorData(inn: Innertube): string {
+    const visitorData = inn.session.context.client.visitorData;
+    if (!visitorData) throw new Error('Missing visitorData in Innertube session context');
+    return visitorData;
+  }
 
+  private static async mintPoTokensSafe(id: string, visitorData: string): Promise<{ contentPoToken: string; sessionPoToken: string; }> {
+    const { generatePoToken } = await import("@/lib/pot.lib");
     try {
-      ({ contentPoToken, sessionPoToken } = await generatePoToken(id, visitorData))
+      const ctx = InnertubeService.requestContext.getStore();
+      return await generatePoToken(id, visitorData, { signal: ctx?.signal });
     } catch (error) {
+      const ctx = InnertubeService.requestContext.getStore();
       logger.error('getVideoInfoWithPoToken:generatePoToken error', { id, requestId: ctx?.requestId, error });
       throw error;
     }
-    let info: YT.VideoInfo;
+  }
+
+  private static async getWebInfoSafe(inn: Innertube, id: string, po: string): Promise<YT.VideoInfo> {
     try {
-      info = await webInnertube.getInfo(id, { po_token: contentPoToken });
+      return await inn.getInfo(id, { po_token: po });
     } catch (error) {
+      const ctx = InnertubeService.requestContext.getStore();
       logger.error('getVideoInfoWithPoToken:getInfo error', { id, requestId: ctx?.requestId, error });
       throw error;
     }
-
-    // temporary workaround for SABR-only responses
-    let mwebInfo: YT.VideoInfo | undefined;
-    try {
-      mwebInfo = await webInnertube.getBasicInfo(id, { client: 'MWEB', po_token: contentPoToken })
-    } catch (error) {
-      // Best-effort workaround; do not fail request if MWEB path errors
-      logger.warn('getVideoInfoWithPoToken:MWEB getBasicInfo failed; continuing with WEB info', { id, requestId: ctx?.requestId, error });
-    }
-
-    if (mwebInfo?.playability_status?.status === 'OK' && mwebInfo?.streaming_data) {
-      info.playability_status = mwebInfo.playability_status
-      info.streaming_data = mwebInfo.streaming_data
-
-      clientName = 'MWEB'
-    }
-
-    let hasTrailer = info.has_trailer
-    let trailerIsAgeRestricted = info.getTrailerInfo() === null
-
-    if (
-      ((info?.playability_status?.status === 'UNPLAYABLE' || info?.playability_status?.status === 'LOGIN_REQUIRED') &&
-        info?.playability_status?.reason === 'Sign in to confirm your age') ||
-      (hasTrailer && trailerIsAgeRestricted)
-    ) {
-      try {
-        const webEmbeddedInnertube = await InnertubeService.createInnertube({ clientType: ClientType.WEB_EMBEDDED })
-        webEmbeddedInnertube.session.context.client.visitorData = webInnertube.session.context.client.visitorData
-
-        const errorScreen = info?.playability_status?.error_screen as { video_id?: string } | undefined;
-        const videoId = hasTrailer && trailerIsAgeRestricted ? (errorScreen?.video_id ?? id) : id
-
-        // getBasicInfo needs the signature timestamp (sts) from inside the player
-        webEmbeddedInnertube.session.player = webInnertube.session.player
-
-        const bypassedInfo = await webEmbeddedInnertube.getBasicInfo(videoId, { client: 'WEB_EMBEDDED', po_token: contentPoToken })
-
-        if (bypassedInfo?.playability_status?.status === 'OK' && bypassedInfo?.streaming_data) {
-          info.playability_status = bypassedInfo.playability_status
-          info.streaming_data = bypassedInfo.streaming_data
-          info.basic_info.start_timestamp = bypassedInfo.basic_info.start_timestamp
-          info.basic_info.duration = bypassedInfo.basic_info.duration
-          info.captions = bypassedInfo.captions
-          info.storyboards = bypassedInfo.storyboards
-
-          hasTrailer = false
-          trailerIsAgeRestricted = false
-
-          clientName = webEmbeddedInnertube.session.context.client.clientName
-        }
-      } catch (error) {
-        // Best-effort bypass; log and continue with existing info if WEB_EMBEDDED path fails
-        logger.warn('getVideoInfoWithPoToken:WEB_EMBEDDED bypass failed; continuing without bypass', { id, requestId: ctx?.requestId, error });
-      }
-    }
-
-    if ((info?.playability_status?.status === 'UNPLAYABLE' && (!hasTrailer || trailerIsAgeRestricted)) ||
-      info?.playability_status?.status === 'LOGIN_REQUIRED') {
-      return parse ? parseVideoInfo(info) : info
-    }
-
-    if (hasTrailer && info?.playability_status?.status !== 'OK') {
-      const trailerInfo = info.getTrailerInfo()
-
-      // don't override the timestamp of when the video will premiere for upcoming videos
-      if (info.basic_info.start_timestamp && info?.playability_status?.status !== 'LIVE_STREAM_OFFLINE') {
-        // trailerInfo?.basic_info.start_timestamp can be undefined; coalesce to null to match type Date | null
-        info.basic_info.start_timestamp = trailerInfo?.basic_info.start_timestamp ?? null
-      }
-
-      info.playability_status = trailerInfo?.playability_status
-      info.streaming_data = trailerInfo?.streaming_data
-      info.basic_info.duration = trailerInfo?.basic_info.duration
-      info.captions = trailerInfo?.captions
-      info.storyboards = trailerInfo?.storyboards
-    }
-
-    if (info.streaming_data) {
-      if (info.streaming_data.dash_manifest_url) {
-        let url = info.streaming_data.dash_manifest_url
-
-        if (url.includes('?')) {
-          url += `&pot=${encodeURIComponent(sessionPoToken)}&mpd_version=7`
-        } else {
-          url += `${url.endsWith('/') ? '' : '/'}pot/${encodeURIComponent(sessionPoToken)}/mpd_version/7`
-        }
-
-        info.streaming_data.dash_manifest_url = url
-      }
-    }
-
-    if (info.captions?.caption_tracks) {
-      for (const captionTrack of info.captions.caption_tracks) {
-        const url = new URL(captionTrack.base_url)
-
-        url.searchParams.set('potc', '1')
-        url.searchParams.set('pot', contentPoToken)
-        url.searchParams.set('c', clientName)
-        url.searchParams.set('fmt', 'json3');
-
-        // Remove &xosf=1 as it adds `position:63% line:0%` to the subtitle lines
-        // placing them in the top right corner
-        url.searchParams.delete('xosf');
-
-        captionTrack.base_url = url.toString()
-      }
-    }
-
-    return parse ? parseVideoInfo(info) : info
   }
+
+  private static async getMwebInfoBestEffort(inn: Innertube, id: string, po: string): Promise<YT.VideoInfo | undefined> {
+    try {
+      return await inn.getBasicInfo(id, { client: 'MWEB', po_token: po });
+    } catch (error) {
+      const ctx = InnertubeService.requestContext.getStore();
+      logger.warn('getVideoInfoWithPoToken:MWEB getBasicInfo failed; continuing with WEB info', { id, requestId: ctx?.requestId, error });
+      return undefined;
+    }
+  }
+
+  private static mergeInfoFromMweb(info: YT.VideoInfo, mwebInfo: YT.VideoInfo): void {
+    info.playability_status = mwebInfo.playability_status;
+    info.streaming_data = mwebInfo.streaming_data;
+  }
+
+  private static needsAgeBypass(info: YT.VideoInfo, hasTrailer: boolean, trailerIsAgeRestricted: boolean): boolean {
+    const status = info?.playability_status?.status;
+    const reason = info?.playability_status?.reason;
+    return (
+      ((status === 'UNPLAYABLE' || status === 'LOGIN_REQUIRED') && reason === 'Sign in to confirm your age') ||
+      (hasTrailer && trailerIsAgeRestricted)
+    );
+  }
+
+  private static isUnplayableOrLoginRequired(info: YT.VideoInfo, hasTrailer: boolean, trailerIsAgeRestricted: boolean): boolean {
+    const status = info?.playability_status?.status;
+    return (status === 'UNPLAYABLE' && (!hasTrailer || trailerIsAgeRestricted)) || status === 'LOGIN_REQUIRED';
+  }
+
+  private static async tryWebEmbeddedBypassBestEffort(webInnertube: Innertube, info: YT.VideoInfo, id: string, po: string): Promise<{ updated: boolean; clientName?: string; hasTrailer: boolean; trailerIsAgeRestricted: boolean; } | undefined> {
+    try {
+      const webEmbeddedInnertube = await InnertubeService.createInnertube({ clientType: ClientType.WEB_EMBEDDED });
+      webEmbeddedInnertube.session.context.client.visitorData = webInnertube.session.context.client.visitorData;
+
+      const errorScreen = info?.playability_status?.error_screen as { video_id?: string } | undefined;
+      const videoId = info.has_trailer && info.getTrailerInfo() === null ? (errorScreen?.video_id ?? id) : id;
+
+      // getBasicInfo needs the signature timestamp (sts) from inside the player
+      webEmbeddedInnertube.session.player = webInnertube.session.player;
+
+      const bypassedInfo = await webEmbeddedInnertube.getBasicInfo(videoId, { client: 'WEB_EMBEDDED', po_token: po });
+      if (bypassedInfo?.playability_status?.status === 'OK' && bypassedInfo?.streaming_data) {
+        info.playability_status = bypassedInfo.playability_status;
+        info.streaming_data = bypassedInfo.streaming_data;
+        info.basic_info.start_timestamp = bypassedInfo.basic_info.start_timestamp;
+        info.basic_info.duration = bypassedInfo.basic_info.duration;
+        info.captions = bypassedInfo.captions;
+        info.storyboards = bypassedInfo.storyboards;
+
+        return {
+          updated: true,
+          clientName: webEmbeddedInnertube.session.context.client.clientName,
+          hasTrailer: false,
+          trailerIsAgeRestricted: false,
+        };
+      }
+    } catch (error) {
+      const ctx = InnertubeService.requestContext.getStore();
+      logger.warn('getVideoInfoWithPoToken:WEB_EMBEDDED bypass failed; continuing without bypass', { id, requestId: ctx?.requestId, error });
+    }
+    return { updated: false, hasTrailer: info.has_trailer, trailerIsAgeRestricted: info.getTrailerInfo() === null };
+  }
+
+  private static applyTrailerInfo(info: YT.VideoInfo): void {
+    const trailerInfo = info.getTrailerInfo();
+    if (!trailerInfo) return;
+    if (info.basic_info.start_timestamp && info?.playability_status?.status !== 'LIVE_STREAM_OFFLINE') {
+      info.basic_info.start_timestamp = trailerInfo?.basic_info.start_timestamp ?? null;
+    }
+    info.playability_status = trailerInfo?.playability_status;
+    info.streaming_data = trailerInfo?.streaming_data;
+    info.basic_info.duration = trailerInfo?.basic_info.duration;
+    info.captions = trailerInfo?.captions;
+    info.storyboards = trailerInfo?.storyboards;
+  }
+
+  private static augmentStreamingDataWithSessionPot(info: YT.VideoInfo, sessionPoToken: string): void {
+    if (!info.streaming_data?.dash_manifest_url) return;
+    let url = info.streaming_data.dash_manifest_url;
+    if (url.includes('?')) {
+      url += `&pot=${encodeURIComponent(sessionPoToken)}&mpd_version=7`;
+    } else {
+      url += `${url.endsWith('/') ? '' : '/'}pot/${encodeURIComponent(sessionPoToken)}/mpd_version/7`;
+    }
+    info.streaming_data.dash_manifest_url = url;
+  }
+
+  private static augmentCaptionsWithPot(info: YT.VideoInfo, contentPoToken: string, clientName: string): void {
+    if (!info.captions?.caption_tracks) return;
+    for (const captionTrack of info.captions.caption_tracks) {
+      const url = new URL(captionTrack.base_url);
+      url.searchParams.set('potc', '1');
+      url.searchParams.set('pot', contentPoToken);
+      url.searchParams.set('c', clientName);
+      url.searchParams.set('fmt', 'json3');
+      // Remove &xosf=1 as it adds `position:63% line:0%` to the subtitle lines
+      url.searchParams.delete('xosf');
+      captionTrack.base_url = url.toString();
+    }
+  }
+  // #endregion
 
   public static async getInstance(): Promise<InnertubeService> {
     if (this.instance) {
@@ -303,6 +430,11 @@ export class InnertubeService {
   private static isPlayerEndpoint(url: string): boolean {
     // YouTube v1 player endpoint is the usual throttling target
     return url.includes('/v1/player');
+  }
+
+  private static isTranscriptEndpoint(url: string): boolean {
+    // YouTube transcript endpoint used by youtubei.js
+    return url.includes('/v1/get_transcript');
   }
 
   private static toFetchArgs(input: RequestInfo | URL, init?: RequestInit): { url: string | URL; init?: RequestInit } {
@@ -358,8 +490,10 @@ export class InnertubeService {
       writableInit.body = (writableInit.body as string).replace('"videoId":', '"params":"8AEB","videoId":')
     }
 
-    // Fast-path: use native fetch directly for non-player endpoints without proxy needs
-    if (!isPlayerEndpoint && !isProxyEnabled) {
+    // Fast-path: use native fetch directly for non-player endpoints without proxy needs,
+    // except transcript endpoint which benefits from our retry logic
+    const isTranscriptEndpoint = InnertubeService.isTranscriptEndpoint(targetUrl);
+    if (!isPlayerEndpoint && !isProxyEnabled && !isTranscriptEndpoint) {
       // Combine context signal and any init.signal
       const { signal, cleanup } = InnertubeService.linkAbortSignals([ctx?.signal, (writableInit?.signal as AbortSignal | undefined)]);
       const res = await fetch(url as any, { ...(writableInit || {}), signal } as RequestInit);
@@ -382,6 +516,11 @@ export class InnertubeService {
     const requestOptions: HttpOptions = {
       ...InnertubeService.DEFAULT_HTTP_OPTIONS,
       ...(isProxyNeeded ? { useProxy: true } : {}),
+      // Extend retry behavior for transcript endpoint to also retry on 400 FAILED_PRECONDITION
+      ...(isTranscriptEndpoint ? { retryOnStatus: [
+        ...(InnertubeService.DEFAULT_HTTP_OPTIONS.retryOnStatus ?? []),
+        400,
+      ] } : {}),
       signal: compositeSignal,
     }
 
