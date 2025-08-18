@@ -1,0 +1,30 @@
+import { pgTable, text, boolean, integer, bigint, jsonb, timestamp, pgSchema } from 'drizzle-orm/pg-core';
+
+// Use custom PostgreSQL schema: "yt-svc"
+const ytSvc = pgSchema('yt-svc');
+
+export const videos = ytSvc.table('videos', {
+  id: text('id').primaryKey(),
+  title: text('title').notNull(),
+  author: text('author').notNull(),
+  description: text('description').notNull(),
+  thumbnails: jsonb('thumbnails').$type<Array<{ url: string; width: number; height: number }>>().notNull(),
+  category: text('category').notNull(),
+  tags: jsonb('tags').$type<string[]>().notNull(),
+  duration: integer('duration').notNull(),
+  channel: jsonb('channel').$type<{ id: string; name: string; url: string }>().notNull(),
+  viewCount: bigint('view_count', { mode: 'number' }).notNull(),
+  likeCount: bigint('like_count', { mode: 'number' }).notNull(),
+  isPrivate: boolean('is_private').notNull(),
+  isUnlisted: boolean('is_unlisted').notNull(),
+  isFamilySafe: boolean('is_family_safe').notNull(),
+  publishDateRaw: text('publish_date_raw').notNull(),
+  publishDateFormatted: text('publish_date_formatted').notNull(),
+  transcriptLanguages: jsonb('transcript_languages').$type<string[]>().notNull(),
+  hasTranscripts: boolean('has_transcripts').notNull(),
+  captionLanguages: jsonb('caption_languages').$type<Array<{ name: string; languageCode: string; rtl: boolean; isTranslatable: boolean }>>().notNull(),
+  hasCaptions: boolean('has_captions').notNull(),
+  captionTranslationLanguages: jsonb('caption_translation_languages').$type<Array<{ languageCode: string; name: string }>>().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});

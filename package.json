@@ -3,20 +3,25 @@
   "scripts": {
     "dev": "bun run --hot src/index.ts",
     "build": "bun build --target=bun --minify --sourcemap --outdir=dist --external=canvas src/index.ts",
-    "start": "bun run dist/index.js"
+    "start": "bun run dist/index.js",
+    "drizzle:generate": "bunx drizzle-kit generate",
+    "drizzle:migrate": "bunx drizzle-kit migrate"
   },
   "dependencies": {
     "bgutils-js": "^3.2.0",
     "canvas": "^3.1.2",
     "date-fns": "^4.1.0",
+    "drizzle-orm": "^0.44.4",
     "hono": "^4.9.1",
     "jsdom": "^26.1.0",
+    "postgres": "^3.4.7",
     "protobufjs": "^7.5.3",
     "youtubei.js": "^15.0.1",
     "zod": "^4.0.17"
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "@types/jsdom": "^21.1.7"
+    "@types/jsdom": "^21.1.7",
+    "drizzle-kit": "^0.31.4"
   }
 }
