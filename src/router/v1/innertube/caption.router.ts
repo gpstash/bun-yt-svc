@@ -4,38 +4,14 @@ import type { AppSchema } from '@/app';
 import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODES } from '@/lib/hono.util';
 import { HttpError } from '@/lib/http.lib';
 import { z } from 'zod';
-import { redisGetJson, redisSetJson, redisAcquireLock, redisReleaseLock, redisWaitForKey } from '@/lib/redis.lib';
+import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
+import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegativeCache } from '@/lib/cache.util';
 import { getCaptionByVideoAndLanguage, hasCaptionLanguage, getPreferredCaptionLanguage, upsertCaption } from '@/service/caption.service';
 import { getVideoById, upsertVideo } from '@/service/video.service';
 
 export const v1InnertubeCaptionRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:caption');
 logger.debug('Initializing /v1/innertube/caption router');
-
-// In-process singleflight map to dedupe concurrent fetches per cache key
-const inflightFetches = new Map<string, Promise<{ info: any; resolvedLang: string }>>();
-
-function jitterTtl(base: number): number {
-  const spread = Math.max(1, Math.floor(base * 0.1)); // 10%
-  const direction = Math.random() < 0.5 ? -1 : 1;
-  const delta = Math.floor(Math.random() * spread) * direction;
-  return Math.max(1, base + delta);
-}
-
-async function singleflightFetch(
-  key: string,
-  doFetch: () => Promise<{ info: any; resolvedLang: string }>
-): Promise<{ info: any; resolvedLang: string }> {
-  const existing = inflightFetches.get(key);
-  if (existing) return existing;
-  const p = doFetch()
-    .catch((e) => { throw e; })
-    .finally(() => {
-      inflightFetches.delete(key);
-    });
-  inflightFetches.set(key, p);
-  return p;
-}
 
 function buildCacheKey(videoId: string, language: string | undefined | null, translateLanguage?: string | null): string {
   const cacheLang = language ?? 'default';
@@ -234,8 +210,8 @@ v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
     const cached = await redisGetJson<any>(cacheKey);
     if (cached) {
       logger.info('Cache hit for caption', { videoId, language: effectiveLang, translateLanguage, requestId, cacheKey });
-      if (cached && cached.__err) {
-        return c.json({ error: cached.error, code: cached.code }, cached.__status as any);
+      if (isNegativeCache(cached)) {
+        return c.json({ error: cached.error, code: cached.code }, (cached.__status as any) ?? 400);
       }
       return c.json(cached);
     }
@@ -261,8 +237,23 @@ v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
         const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, translateLanguage, requestId);
         logger.info('DB hit but stale; serving stale and refreshing in background', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, ageSeconds, ttlSeconds, requestId });
         const bgKey = buildCacheKey(videoId, effectiveLang, translateLanguage);
-        // Fire-and-forget singleflight refresh
-        void singleflightFetch(bgKey, () => fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId));
+        // Fire-and-forget background refresh with distributed lock
+        void (async () => {
+          try {
+            const { resolvedLang } = await fetchWithRedisLock(bgKey, ttlSeconds, async () => {
+              return await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
+            });
+            if (!requestedLang && !translateLanguage) {
+              try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch { }
+            }
+          } catch (e) {
+            const mapped = mapErrorToHttp(e);
+            if (mapped.status >= 400 && mapped.status < 500) {
+              const neg = makeNegativeCache(mapped.message || 'Bad Request', translateLanguage ? ERROR_CODES.INVALID_TRANSLATE_LANGUAGE : ERROR_CODES.INVALID_LANGUAGE, mapped.status);
+              try { await redisSetJson(bgKey, neg, jitterTtl(60)); } catch { }
+            }
+          }
+        })();
         return c.json(assembled);
       } else {
         logger.debug('DB miss for caption', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, requestId });
@@ -273,24 +264,10 @@ v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
 
     // 3) Fetch -> Persist -> Cache (singleflight + distributed lock to dedupe across instances)
     const fetchKey = buildCacheKey(videoId, effectiveLang, translateLanguage);
-    const lockKey = `${fetchKey}:_lock`;
-    const startWaitMs = 5000;
-    const res = await singleflightFetch(fetchKey, async () => {
-      const token = await redisAcquireLock(lockKey, Math.max(10000, ttlSeconds * 1000)); // ~10s lock (ms)
-      if (!token) {
-        // Another instance is fetching; wait briefly for cache, then proceed if still missing
-        const waited = await redisWaitForKey<any>(fetchKey, startWaitMs, 100);
-        if (waited) return { info: waited, resolvedLang: effectiveLang || 'default' } as const;
-        // Fall through to fetch without lock to avoid long stalls
-        const r = await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
-        return r;
-      }
-      try {
-        const r = await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
-        return r;
-      } finally {
-        await redisReleaseLock(lockKey, token).catch(() => {});
-      }
+    const res = await singleflight(fetchKey, async () => {
+      return await fetchWithRedisLock(fetchKey, ttlSeconds, async () => {
+        return await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
+      });
     });
     const { info, resolvedLang } = res;
     if (!requestedLang && !translateLanguage) {
@@ -307,11 +284,10 @@ v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
     let mapped = mapErrorToHttp(err);
     const isValidation = (err as any)?.name === 'ValidationError' || (mapped.status >= 400 && mapped.status < 500);
     if (isValidation) {
-      const neg = { error: mapped.message || 'Bad Request', code: translateLanguage ? ERROR_CODES.INVALID_TRANSLATE_LANGUAGE : ERROR_CODES.INVALID_LANGUAGE, __err: true, __status: mapped.status };
-      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch {}
+      const neg = makeNegativeCache(mapped.message || 'Bad Request', translateLanguage ? ERROR_CODES.INVALID_TRANSLATE_LANGUAGE : ERROR_CODES.INVALID_LANGUAGE, mapped.status);
+      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch { }
     }
     logger.error('Error in /v1/innertube/caption', { err, mapped, videoId, language: effectiveLang, requestId });
     return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
   }
-})
-;
+});
