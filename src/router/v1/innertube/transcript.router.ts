@@ -3,6 +3,7 @@ import { HttpError } from '@/lib/http.lib';
 import { Context, Hono } from 'hono';
 import type { AppSchema } from '@/app';
 import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODES } from '@/lib/hono.util';
+import type { ErrorCode } from '@/lib/hono.util';
 import { z } from 'zod';
 import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
 import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegativeCache } from '@/lib/cache.util';
@@ -143,6 +144,13 @@ v1InnertubeTranscriptRouter.get('/', async (c: Context<AppSchema>) => {
   const rawId = c.req.query('v');
   const l = c.req.query('l');
   const requestId = c.get('requestId');
+  // Only negative-cache these language-related 4xx codes
+  const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode>([
+    ERROR_CODES.INVALID_LANGUAGE,
+    ERROR_CODES.INVALID_TRANSLATE_LANGUAGE,
+    ERROR_CODES.YT_TRANSLATION_UNSUPPORTED,
+    ERROR_CODES.YT_TRANSLATION_SAME_LANGUAGE,
+  ]);
 
   const QuerySchema = z
     .object({
@@ -213,8 +221,8 @@ v1InnertubeTranscriptRouter.get('/', async (c: Context<AppSchema>) => {
             if (!requestedLang) { try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch {} }
           } catch (e) {
             const mapped = mapErrorToHttp(e);
-            if (mapped.status >= 400 && mapped.status < 500) {
-              const neg = makeNegativeCache(mapped.message || 'Bad Request', ERROR_CODES.INVALID_LANGUAGE, mapped.status);
+            if (mapped.status >= 400 && mapped.status < 500 && LANG_RELATED_CODES.has(mapped.code)) {
+              const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
               try { await redisSetJson(fetchKey, neg, jitterTtl(60)); } catch {}
             }
           }
@@ -248,8 +256,8 @@ v1InnertubeTranscriptRouter.get('/', async (c: Context<AppSchema>) => {
     }
     const mapped = mapErrorToHttp(err);
     // Negative cache for 4xx to reduce repeated work
-    if (mapped.status >= 400 && mapped.status < 500) {
-      const neg = makeNegativeCache(mapped.message || 'Bad Request', ERROR_CODES.INVALID_LANGUAGE, mapped.status);
+    if (mapped.status >= 400 && mapped.status < 500 && LANG_RELATED_CODES.has(mapped.code)) {
+      const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
       try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch {}
     }
     logger.error('Error in /v1/innertube/transcript', { err, mapped, videoId, language: effectiveLang, requestId });

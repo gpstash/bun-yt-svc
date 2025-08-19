@@ -2,6 +2,7 @@ import { createLogger } from '@/lib/logger.lib';
 import { Context, Hono } from 'hono';
 import type { AppSchema } from '@/app';
 import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODES } from '@/lib/hono.util';
+import type { ErrorCode } from '@/lib/hono.util';
 import { HttpError } from '@/lib/http.lib';
 import { z } from 'zod';
 import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
@@ -147,6 +148,13 @@ v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
   const rawId = c.req.query('v');
   const l = c.req.query('l');
   const tl = c.req.query('tl');
+  // Only negative-cache these language-related 4xx codes
+  const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode> ([
+    ERROR_CODES.INVALID_LANGUAGE,
+    ERROR_CODES.INVALID_TRANSLATE_LANGUAGE,
+    ERROR_CODES.YT_TRANSLATION_UNSUPPORTED,
+    ERROR_CODES.YT_TRANSLATION_SAME_LANGUAGE,
+  ]);
 
   const QuerySchema = z.object({
     v: z.string().trim().min(1, 'Missing video id'),
@@ -248,8 +256,8 @@ v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
             }
           } catch (e) {
             const mapped = mapErrorToHttp(e);
-            if (mapped.status >= 400 && mapped.status < 500) {
-              const neg = makeNegativeCache(mapped.message || 'Bad Request', translateLanguage ? ERROR_CODES.INVALID_TRANSLATE_LANGUAGE : ERROR_CODES.INVALID_LANGUAGE, mapped.status);
+            if (mapped.status >= 400 && mapped.status < 500 && LANG_RELATED_CODES.has(mapped.code)) {
+              const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
               try { await redisSetJson(bgKey, neg, jitterTtl(60)); } catch { }
             }
           }
@@ -280,11 +288,10 @@ v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
       logger.info('Request aborted by client', { videoId, language: effectiveLang, requestId });
       return c.json({ error: 'Client Closed Request', code: ERROR_CODES.CLIENT_CLOSED_REQUEST }, STATUS_CLIENT_CLOSED_REQUEST as any);
     }
-    // Negative cache for validation-like errors to reduce repeated work
+    // Negative cache only for language-related 4xx to reduce repeated work
     let mapped = mapErrorToHttp(err);
-    const isValidation = (err as any)?.name === 'ValidationError' || (mapped.status >= 400 && mapped.status < 500);
-    if (isValidation) {
-      const neg = makeNegativeCache(mapped.message || 'Bad Request', translateLanguage ? ERROR_CODES.INVALID_TRANSLATE_LANGUAGE : ERROR_CODES.INVALID_LANGUAGE, mapped.status);
+    if (mapped.status >= 400 && mapped.status < 500 && LANG_RELATED_CODES.has(mapped.code)) {
+      const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
       try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch { }
     }
     logger.error('Error in /v1/innertube/caption', { err, mapped, videoId, language: effectiveLang, requestId });

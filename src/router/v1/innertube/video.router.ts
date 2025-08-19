@@ -79,8 +79,8 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
             });
           } catch (e) {
             const mapped = mapErrorToHttp(e);
-            if (mapped.status >= 400 && mapped.status < 500) {
-              const neg = makeNegativeCache(mapped.message || 'Bad Request', ERROR_CODES.BAD_REQUEST, mapped.status);
+            if (mapped.status >= 400 && mapped.status < 500 && mapped.code === ERROR_CODES.BAD_REQUEST) {
+              const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
               try { await redisSetJson(fetchKey, neg, jitterTtl(60)); } catch { }
             }
           }
@@ -114,8 +114,8 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
     }
     const mapped = mapErrorToHttp(err);
     // Negative cache for 4xx to reduce repeated work
-    if (mapped.status >= 400 && mapped.status < 500) {
-      const neg = makeNegativeCache(mapped.message || 'Bad Request', ERROR_CODES.BAD_REQUEST, mapped.status);
+    if (mapped.status >= 400 && mapped.status < 500 && mapped.code === ERROR_CODES.BAD_REQUEST) {
+      const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
       try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch { }
     }
     logger.error('Error in /v1/innertube/video', { err, mapped, videoId, requestId });
