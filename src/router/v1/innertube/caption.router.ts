@@ -10,6 +10,7 @@ import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegat
 import { getCaptionByVideoAndLanguage, hasCaptionLanguage, getPreferredCaptionLanguage, upsertCaption } from '@/service/caption.service';
 import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
 import { getVideoById, upsertVideo } from '@/service/video.service';
+import { InnertubeService } from '@/service/innertube.service';
 
 export const v1InnertubeCaptionRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:caption');
@@ -379,6 +380,15 @@ v1InnertubeCaptionRouter.post('/batch', async (c: Context<AppSchema>) => {
     return c.json({ error: first?.message || 'Bad Request', code: ERROR_CODES.BAD_REQUEST }, 400);
   }
   const { ids, l, tl } = parsed.data;
+
+  // Ensure player is initialized once before batch to avoid concurrent downloads per video
+  try {
+    await InnertubeService.ensurePlayerReady();
+    logger.debug('Player pre-warmed for caption batch', { requestId });
+  } catch (e) {
+    // Non-fatal: proceed; individual calls will attempt init with singleflight-esque guard
+    logger.warn('Player pre-warm failed; proceeding with batch', { requestId, error: e });
+  }
 
   const throttle = readBatchThrottle(c);
   const results = await throttleMap(ids, async (id) => {

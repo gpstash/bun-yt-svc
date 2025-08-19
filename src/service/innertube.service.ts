@@ -26,8 +26,11 @@ export class InnertubeService {
   constructor(private readonly innertube: Innertube) { }
   // Per-request context to carry AbortSignal from router -> service -> innertube fetches
   private static readonly requestContext = new AsyncLocalStorage<{ signal?: AbortSignal; requestId?: string }>();
-  // Shared cache to be reused across player-enabled Innertube instances in-process
+  // Shared cache to be reused across ALL Innertube instances in-process (persistent)
   private static sharedCache: UniversalCache | undefined;
+  // In-memory cache for player asset responses to avoid repeated downloads within a process
+  private static playerAssetCache = new Map<string, { body: string; status: number; headers: [string, string][] }>();
+  private static playerAssetInflight = new Map<string, Promise<Response>>();
   // Singleton player-enabled Innertube instance to avoid repeated player downloads
   private static playerInnertube: Innertube | undefined;
   // Prevent concurrent duplicate player initializations
@@ -227,7 +230,7 @@ export class InnertubeService {
     const parsed = parseTranscript(parsedVideoInfo, selectedTranscript);
     const durationMs = Math.round(performance.now() - started);
     const ctx2 = InnertubeService.requestContext.getStore();
-    logger.info('getTranscript:done', { id, language, durationMs, requestId: ctx2?.requestId, hasTranscript: parsed.transcript.hasTranscript });
+    logger.info('getTranscript:done', { id, language, durationMs, requestId: ctx2?.requestId, hasTranscript: parsed.transcript.segments.length > 0 });
     return parsed;
   }
 
@@ -262,43 +265,10 @@ export class InnertubeService {
       const visitorData = InnertubeService.assertVisitorData(webInnertube);
       const { contentPoToken, sessionPoToken } = await InnertubeService.mintPoTokensSafe(id, visitorData);
 
-      // Attempt up to 3 times if playability reports "unavailable"
-      let info!: YT.VideoInfo;
-      for (let attempt = 0; attempt < InnertubeService.MAX_PLAYABILITY_ATTEMPTS; attempt++) {
-        try {
-          info = await InnertubeService.getWebInfoSafe(webInnertube, id, contentPoToken);
-        } catch (e) {
-          // On direct WEB failure, try MWEB once for this attempt
-          const mwebOnError = await InnertubeService.getMwebInfoBestEffort(webInnertube, id, contentPoToken);
-          if (mwebOnError) {
-            info = mwebOnError;
-            clientName = 'MWEB';
-          } else {
-            if (attempt >= InnertubeService.MAX_PLAYABILITY_ATTEMPTS - 1) throw e;
-            await InnertubeService.backoffJitter(
-              attempt,
-              InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100,
-              InnertubeService.MAX_BACKOFF_JITTER_MS
-            );
-            continue;
-          }
-        }
-
-        if (!InnertubeService.isUnavailablePlayability(info)) {
-          break;
-        }
-        // If unavailable and not the last attempt, sleep and retry
-        if (attempt < InnertubeService.MAX_PLAYABILITY_ATTEMPTS - 1) {
-          await InnertubeService.backoffJitter(
-            attempt,
-            InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100,
-            InnertubeService.MAX_BACKOFF_JITTER_MS
-          );
-          continue;
-        }
-        // Out of attempts; proceed with current info (unavailable)
-        break;
-      }
+      // Attempt up to 3 times if playability reports "unavailable" (with per-attempt MWEB fallback)
+      const retried = await InnertubeService.getWebOrMwebInfoWithRetries(webInnertube, id, contentPoToken);
+      let info: YT.VideoInfo = retried.info;
+      clientName = retried.clientName ?? clientName;
 
       // SABR-only workaround via MWEB
       const mwebInfo = await InnertubeService.getMwebInfoBestEffort(webInnertube, id, contentPoToken);
@@ -415,6 +385,50 @@ export class InnertubeService {
       reason.includes('unavailable') ||
       embeddable === false
     );
+  }
+
+  // Try WEB with PoToken, and on failure per attempt, try MWEB once. Retry attempts when playability seems unavailable.
+  private static async getWebOrMwebInfoWithRetries(inn: Innertube, id: string, po: string): Promise<{ info: YT.VideoInfo; clientName: string; }> {
+    const ctx = InnertubeService.requestContext.getStore();
+    let last!: YT.VideoInfo;
+    let clientName = inn.session.context.client.clientName;
+    for (let attempt = 0; attempt < InnertubeService.MAX_PLAYABILITY_ATTEMPTS; attempt++) {
+      try {
+        last = await InnertubeService.getWebInfoSafe(inn, id, po);
+      } catch (e) {
+        // On WEB failure, try MWEB once for this attempt
+        const mwebOnError = await InnertubeService.getMwebInfoBestEffort(inn, id, po);
+        if (mwebOnError) {
+          last = mwebOnError;
+          clientName = 'MWEB';
+        } else {
+          if (attempt >= InnertubeService.MAX_PLAYABILITY_ATTEMPTS - 1) throw e;
+          await InnertubeService.backoffJitter(
+            attempt,
+            InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100,
+            InnertubeService.MAX_BACKOFF_JITTER_MS
+          );
+          continue;
+        }
+      }
+
+      if (!InnertubeService.isUnavailablePlayability(last)) {
+        break;
+      }
+      // If unavailable and not the last attempt, sleep and retry
+      if (attempt < InnertubeService.MAX_PLAYABILITY_ATTEMPTS - 1) {
+        await InnertubeService.backoffJitter(
+          attempt,
+          InnertubeService.DEFAULT_HTTP_OPTIONS.backoffBaseMs ?? 100,
+          InnertubeService.MAX_BACKOFF_JITTER_MS
+        );
+        continue;
+      }
+      // Out of attempts; proceed with current info (may still be unavailable)
+      break;
+    }
+    logger.debug('getWebOrMwebInfoWithRetries:done', { id, clientName, requestId: ctx?.requestId });
+    return { info: last, clientName };
   }
 
   // Abort-aware jittered exponential backoff sleep
@@ -548,6 +562,11 @@ export class InnertubeService {
     return url.includes('/v1/get_transcript');
   }
 
+  private static isPlayerAssetUrl(url: string): boolean {
+    // Typical player asset path: /s/player/<playerId>/player_*.js (e.g., base.js)
+    return url.includes('/s/player/') && (url.includes('base.js') || url.includes('player_'));
+  }
+
   private static toFetchArgs(input: RequestInfo | URL, init?: RequestInit): { url: string | URL; init?: RequestInit } {
     if (typeof input === 'string' || input instanceof URL) {
       return { url: input, init };
@@ -588,6 +607,7 @@ export class InnertubeService {
     const start = performance.now();
     const targetUrl = InnertubeService.asUrlString(input);
     const isPlayerEndpoint = InnertubeService.isPlayerEndpoint(targetUrl);
+    const isPlayerAsset = InnertubeService.isPlayerAssetUrl(targetUrl);
     const isProxyEnabled = process.env.PROXY_STATUS === 'active';
     // Only proxy the player endpoint when proxy is active
     const isProxyNeeded = isProxyEnabled && isPlayerEndpoint;
@@ -599,6 +619,31 @@ export class InnertubeService {
     let writableInit: RequestInit | undefined = mergedInit ? { ...mergedInit } : undefined;
     if (isPlayerEndpoint && writableInit?.body && typeof writableInit.body === 'string') {
       writableInit.body = (writableInit.body as string).replace('"videoId":', '"params":"8AEB","videoId":')
+    }
+
+    // If this is a player asset (JS), serve from in-memory cache or coalesce concurrent fetches
+    if (isPlayerAsset && (mergedInit?.method ?? 'GET').toUpperCase() === 'GET') {
+      const key = typeof url === 'string' ? url : String(url);
+      const cached = InnertubeService.playerAssetCache.get(key);
+      if (cached) {
+        return new Response(cached.body, { status: cached.status, headers: cached.headers });
+      }
+      const inflight = InnertubeService.playerAssetInflight.get(key);
+      if (inflight) {
+        return await inflight;
+      }
+      const fetchPromise = (async () => {
+        // Use resilient http() without proxy for static asset
+        const res = await http(url, { ...(mergedInit || {}) });
+        const text = await res.text();
+        const headersArr: [string, string][] = [];
+        res.headers.forEach((v, k) => headersArr.push([k, v]));
+        InnertubeService.playerAssetCache.set(key, { body: text, status: res.status, headers: headersArr });
+        InnertubeService.playerAssetInflight.delete(key);
+        return new Response(text, { status: res.status, headers: headersArr });
+      })();
+      InnertubeService.playerAssetInflight.set(key, fetchPromise);
+      return await fetchPromise;
     }
 
     // Fast-path: use native fetch directly for non-player endpoints without proxy needs,
@@ -707,14 +752,12 @@ export class InnertubeService {
       ...opts,
     };
 
-    let cache: UniversalCache | undefined;
-    if (withPlayer) {
-      // Initialize and reuse a single in-process cache for player data
-      if (!InnertubeService.sharedCache) {
-        InnertubeService.sharedCache = new UniversalCache(false);
-      }
-      cache = InnertubeService.sharedCache;
+    // Initialize and reuse a single persistent cache for all instances (player, session, etc.)
+    if (!InnertubeService.sharedCache) {
+      // Persistent=true to allow player JSON/JS to be reused reliably across calls
+      InnertubeService.sharedCache = new UniversalCache(true);
     }
+    const cache: UniversalCache | undefined = InnertubeService.sharedCache;
 
     // youtubei.js expects a fetch with optional `preconnect`. Provide a compatible wrapper.
     type FetchWithPreconnect = typeof fetch & { preconnect?: (url: string) => Promise<void> | void };

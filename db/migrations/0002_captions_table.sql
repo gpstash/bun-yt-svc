@@ -9,8 +9,8 @@ create table if not exists "yt-svc"."captions" (
   "segments" jsonb not null,
   "words" jsonb not null,
   "created_at" timestamp with time zone default now() not null,
-  "updated_at" timestamp with time zone default now() not null,
-  constraint captions_video_language_target_unique unique ("video_id", "language", "target_language")
+  "updated_at" timestamp with time zone default now() not null
+  -- Uniqueness enforced via unique index with NULLS NOT DISTINCT (see Indexes section)
 );
 
 -- RLS 
@@ -44,6 +44,10 @@ revoke all on table "yt-svc"."captions" from public;
 --   with check (true);
 
 -- Indexes
+-- Enforce uniqueness across (video_id, language, target_language)
+-- treating NULLs as not distinct (PostgreSQL 15+)
+create unique index if not exists captions_video_lang_target_uidx
+on "yt-svc"."captions" ("video_id", "language", "target_language") nulls not distinct;
 create index if not exists captions_video_id_idx on "yt-svc"."captions" ("video_id");
 create index if not exists captions_language_idx on "yt-svc"."captions" ("language");
 create index if not exists captions_target_language_idx on "yt-svc"."captions" ("target_language");

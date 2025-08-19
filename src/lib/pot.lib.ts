@@ -2,6 +2,8 @@ import type { WebPoSignalOutput } from 'bgutils-js';
 import { BG, buildURL, GOOG_API_KEY, USER_AGENT } from 'bgutils-js';
 import { Innertube } from 'youtubei.js';
 import { createLogger } from './logger.lib';
+import { http } from '@/lib/http.lib';
+import { InnertubeService } from '@/service/innertube.service';
 
 const userAgent = USER_AGENT;
 
@@ -43,7 +45,7 @@ async function fetchInterpreterOnce(url: string, signal?: AbortSignal): Promise<
   const inflight = interpreterInFlight.get(key);
   if (inflight) return inflight;
   const p = (async () => {
-    const res = await fetch(url, { signal });
+    const res = await http(url, { signal });
     const txt = await res.text();
     interpreterCache.set(key, txt);
     interpreterInFlight.delete(key);
@@ -65,8 +67,8 @@ export async function generatePoToken(videoId: string, visitorData: string, opts
   // Initialize DOM environment once
   await ensureDomOnce();
 
-  // Fresh innertube to request a challenge (session cache disabled intentionally)
-  const innertube = await Innertube.create({ user_agent: userAgent, enable_session_cache: false });
+  // Use our service to create Innertube with shared cache and resilient fetch (no player needed)
+  const innertube = await InnertubeService.createInnertube({ withPlayer: false, generateSessionLocally: true });
 
   // #region BotGuard Initialization
   const challengeResponse = await innertube.getAttestationChallenge('ENGAGEMENT_TYPE_UNBOUND');
@@ -90,7 +92,7 @@ export async function generatePoToken(videoId: string, visitorData: string, opts
   const botguardResponse = await botguard.snapshot({ webPoSignalOutput });
   const requestKey = 'O43z0dpjhgX20SCx4KAo';
 
-  const integrityTokenResponse = await fetch(buildURL('GenerateIT', true), {
+  const integrityRes = await http(buildURL('GenerateIT', true), {
     method: 'POST',
     headers: {
       'content-type': 'application/json+protobuf',
@@ -101,8 +103,7 @@ export async function generatePoToken(videoId: string, visitorData: string, opts
     body: JSON.stringify([requestKey, botguardResponse]),
     signal: opts?.signal,
   });
-
-  const response = await integrityTokenResponse.json() as unknown[];
+  const response = await integrityRes.json() as unknown[];
   if (typeof response[0] !== 'string')
     throw new Error('Could not get integrity token');
 
