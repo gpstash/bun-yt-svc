@@ -265,8 +265,10 @@ export function parseTranscript(parsedVideoInfo: ParsedVideoInfo, selectedTransc
 }
 
 export function finCaptionByLanguageCode(captions: Caption[], languageCode: string = "en"): Caption {
-  logger.debug('finCaptionByLanguageCode', { languageCode });
-  const caption = captions.find((caption) => caption.languageCode.toLowerCase() === languageCode.toLowerCase());
+  // Normalize empty/falsy language input to 'en' so callers can pass '' safely
+  const effective = (languageCode && languageCode.trim()) ? languageCode : 'en';
+  logger.debug('finCaptionByLanguageCode', { languageCode: effective });
+  const caption = captions.find((caption) => caption.languageCode.toLowerCase() === effective.toLowerCase());
   if (caption) {
     logger.debug('finCaptionByLanguageCode: found', { caption });
     return caption;
