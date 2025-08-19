@@ -43,22 +43,22 @@ CREATE TABLE "yt-svc"."videos" (
   revoke all on table "yt-svc"."videos" from public;
 
   -- Ensure Supabase roles can access schema and table (RLS still applies)
-  grant usage on schema "yt-svc" to authenticated, service_role;
-  grant select on table "yt-svc"."videos" to authenticated;
-  grant all on table "yt-svc"."videos" to service_role;
+  -- grant usage on schema "yt-svc" to authenticated, service_role;
+  -- grant select on table "yt-svc"."videos" to authenticated;
+  -- grant all on table "yt-svc"."videos" to service_role;
 
-  -- Allow only Supabase 'authenticated' role to read
-  create policy "videos_read_authenticated" on "yt-svc"."videos"
-    for select
-    to authenticated
-    using (true);
+  -- -- Allow only Supabase 'authenticated' role to read
+  -- create policy "videos_read_authenticated" on "yt-svc"."videos"
+  --   for select
+  --   to authenticated
+  --   using (true);
 
-  -- Allow only Supabase 'service_role' to write (insert/update/delete)
-  create policy "videos_write_service" on "yt-svc"."videos"
-    for all
-    to service_role
-    using (true)
-    with check (true);
+  -- -- Allow only Supabase 'service_role' to write (insert/update/delete)
+  -- create policy "videos_write_service" on "yt-svc"."videos"
+  --   for all
+  --   to service_role
+  --   using (true)
+  --   with check (true);
 
 -- Indexes
 create index if not exists videos_created_at_idx on "yt-svc"."videos" ("created_at");

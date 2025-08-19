@@ -25,21 +25,21 @@ drop policy if exists "transcripts_delete_all" on "yt-svc"."transcripts";
 revoke all on table "yt-svc"."transcripts" from public;
 
 -- Grants
-grant usage on schema "yt-svc" to authenticated, service_role;
-grant select on table "yt-svc"."transcripts" to authenticated;
-grant all on table "yt-svc"."transcripts" to service_role;
+-- grant usage on schema "yt-svc" to authenticated, service_role;
+-- grant select on table "yt-svc"."transcripts" to authenticated;
+-- grant all on table "yt-svc"."transcripts" to service_role;
 
--- Policies
-create policy "transcripts_read_authenticated" on "yt-svc"."transcripts"
-  for select
-  to authenticated
-  using (true);
+-- -- Policies
+-- create policy "transcripts_read_authenticated" on "yt-svc"."transcripts"
+--   for select
+--   to authenticated
+--   using (true);
 
-create policy "transcripts_write_service" on "yt-svc"."transcripts"
-  for all
-  to service_role
-  using (true)
-  with check (true);
+-- create policy "transcripts_write_service" on "yt-svc"."transcripts"
+--   for all
+--   to service_role
+--   using (true)
+--   with check (true);
 
 -- Indexes
 create index if not exists transcripts_video_id_idx on "yt-svc"."transcripts" ("video_id");

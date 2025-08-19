@@ -27,21 +27,21 @@ drop policy if exists "captions_delete_all" on "yt-svc"."captions";
 revoke all on table "yt-svc"."captions" from public;
 
 -- Grants
-grant usage on schema "yt-svc" to authenticated, service_role;
-grant select on table "yt-svc"."captions" to authenticated;
-grant all on table "yt-svc"."captions" to service_role;
+-- grant usage on schema "yt-svc" to authenticated, service_role;
+-- grant select on table "yt-svc"."captions" to authenticated;
+-- grant all on table "yt-svc"."captions" to service_role;
 
--- Policies
-create policy "captions_read_authenticated" on "yt-svc"."captions"
-  for select
-  to authenticated
-  using (true);
+-- -- Policies
+-- create policy "captions_read_authenticated" on "yt-svc"."captions"
+--   for select
+--   to authenticated
+--   using (true);
 
-create policy "captions_write_service" on "yt-svc"."captions"
-  for all
-  to service_role
-  using (true)
-  with check (true);
+-- create policy "captions_write_service" on "yt-svc"."captions"
+--   for all
+--   to service_role
+--   using (true)
+--   with check (true);
 
 -- Indexes
 create index if not exists captions_video_id_idx on "yt-svc"."captions" ("video_id");
