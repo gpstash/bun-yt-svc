@@ -17,7 +17,9 @@ PROXY_HOST = "gw-ap.scrapeless.io"
 PROXY_PORT = "8789"
 PROXY_USERNAME = "821A761F1651-proxy-country_SG-r_0m-s_2Z1YbYWeir"
 
-VIDEO_CACHE_TTL_SECONDS = "14400"
+VIDEO_CACHE_TTL_SECONDS = "14400"      # 4 hours
+TRANSCRIPT_CACHE_TTL_SECONDS = "86400" # 1 day
+CAPTION_CACHE_TTL_SECONDS = "86400"    # 1 day
 
 [http_service]
 internal_port = 1331
