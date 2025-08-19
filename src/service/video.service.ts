@@ -112,8 +112,35 @@ export async function getVideoById(id: string): Promise<{ video: ParsedVideoInfo
     logger.warn('DB is not initialized. Skipping getVideoById', { id });
     return null;
   }
-  const rows = await db.select().from(videos).where(eq(videos.id, id)).limit(1);
-  const row = rows[0];
+  const rows = await db
+    .select({
+      id: videos.id,
+      title: videos.title,
+      author: videos.author,
+      description: videos.description,
+      thumbnails: videos.thumbnails,
+      category: videos.category,
+      tags: videos.tags,
+      duration: videos.duration,
+      channel: videos.channel,
+      viewCount: videos.viewCount,
+      likeCount: videos.likeCount,
+      isPrivate: videos.isPrivate,
+      isUnlisted: videos.isUnlisted,
+      isFamilySafe: videos.isFamilySafe,
+      publishDateRaw: videos.publishDateRaw,
+      publishDateFormatted: videos.publishDateFormatted,
+      transcriptLanguages: videos.transcriptLanguages,
+      hasTranscripts: videos.hasTranscripts,
+      captionLanguages: videos.captionLanguages,
+      hasCaptions: videos.hasCaptions,
+      captionTranslationLanguages: videos.captionTranslationLanguages,
+      updatedAt: videos.updatedAt,
+    })
+    .from(videos)
+    .where(eq(videos.id, id))
+    .limit(1);
+  const row = rows[0] as any;
   if (!row) return null;
   const parsed = mapRowToParsed(row as VideoRow);
   return { video: parsed, updatedAt: row.updatedAt };

@@ -5,11 +5,32 @@ import type { AppSchema } from '@/app';
 import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODES } from '@/lib/hono.util';
 import { z } from 'zod';
 import { upsertVideo, getVideoById } from '@/service/video.service';
-import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
+import { redisGetJson, redisSetJson, redisAcquireLock, redisReleaseLock, redisWaitForKey } from '@/lib/redis.lib';
 
 export const v1InnertubeVideoRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:video');
 logger.debug('Initializing /v1/innertube/video router');
+
+function buildCacheKey(videoId: string) {
+  return `yt:video:${videoId}`;
+}
+
+function jitterTtl(ttlSeconds: number): number {
+  const jitter = 0.1 * ttlSeconds;
+  const delta = (Math.random() * 2 - 1) * jitter;
+  return Math.max(1, Math.floor(ttlSeconds + delta));
+}
+
+const inflightFetches = new Map<string, Promise<any>>();
+async function singleflightFetch<T>(key: string, doFetch: () => Promise<T>): Promise<T> {
+  const existing = inflightFetches.get(key);
+  if (existing) return existing as Promise<T>;
+  const p = doFetch()
+    .catch((e) => { throw e; })
+    .finally(() => inflightFetches.delete(key));
+  inflightFetches.set(key, p as any);
+  return p as Promise<T>;
+}
 
 v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
   const rawId = c.req.query('v');
@@ -28,7 +49,7 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
   }
 
   const videoId = parsed.data.v;
-  const cacheKey = `yt:video:${videoId}`;
+  const cacheKey = buildCacheKey(videoId);
   const ttlSeconds = c.get('config').VIDEO_CACHE_TTL_SECONDS;
 
   try {
@@ -36,6 +57,9 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
     const cached = await redisGetJson<any>(cacheKey);
     if (cached) {
       logger.info('Cache hit for video', { videoId, requestId });
+      if (cached.__err) {
+        return c.json({ error: cached.error, code: cached.code }, (cached.__status as any) ?? 400);
+      }
       return c.json(cached);
     }
 
@@ -50,7 +74,7 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
           const remaining = Math.max(1, ttlSeconds - ageSeconds);
           // Warm cache with remaining TTL (non-fatal)
           try {
-            await redisSetJson(cacheKey, dbRes.video, remaining);
+            await redisSetJson(cacheKey, dbRes.video, jitterTtl(remaining));
             logger.debug('Video cached from DB', { videoId, remaining, requestId });
           } catch (cacheErrDb) {
             logger.error('Video caching from DB failed', { videoId, requestId, error: cacheErrDb });
@@ -58,7 +82,34 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
           logger.info('DB hit within TTL for video', { videoId, ageSeconds, remaining, requestId });
           return c.json(dbRes.video);
         }
-        logger.info('DB hit but stale; will fetch YouTube', { videoId, ageSeconds, ttlSeconds, requestId });
+        logger.info('DB hit but stale; will fetch YouTube (SWR)', { videoId, ageSeconds, ttlSeconds, requestId });
+        // Serve stale then refresh in background
+        const stale = dbRes.video;
+        // fire-and-forget background refresh
+        void (async () => {
+          const fetchKey = cacheKey;
+          const lockKey = `${fetchKey}:_lock`;
+          const startWaitMs = 5000;
+          const token = await redisAcquireLock(lockKey, Math.max(10000, ttlSeconds * 1000));
+          if (!token) {
+            await redisWaitForKey<any>(fetchKey, startWaitMs, 100);
+            return;
+          }
+          try {
+            const info = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
+            try { await upsertVideo(info); } catch {}
+            try { await redisSetJson(fetchKey, info, jitterTtl(ttlSeconds)); } catch {}
+          } catch (e) {
+            const mapped = mapErrorToHttp(e);
+            if (mapped.status >= 400 && mapped.status < 500) {
+              const neg = { error: mapped.message || 'Bad Request', code: ERROR_CODES.BAD_REQUEST, __err: true, __status: mapped.status };
+              try { await redisSetJson(fetchKey, neg, jitterTtl(60)); } catch {}
+            }
+          } finally {
+            try { if (token) await redisReleaseLock(lockKey, token); } catch {}
+          }
+        })();
+        return c.json(stale);
       } else {
         logger.debug('DB miss for video', { videoId, requestId });
       }
@@ -66,24 +117,30 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
       logger.error('DB check failed; continuing to fetch from YouTube', { videoId, requestId, error: dbErr });
     }
 
-    logger.info('Cache miss for video, fetching from YouTube', { videoId, requestId });
-    const info = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
-
-    // Persist video info (non-fatal if it fails)
-    try {
-      const res = await upsertVideo(info);
-      logger.info('Video upsert completed', { videoId, upserted: res.upserted, requestId });
-    } catch (persistErr) {
-      logger.error('Video upsert failed', { videoId, requestId, error: persistErr });
-    }
-
-    // Cache the result (non-fatal)
-    try {
-      await redisSetJson(cacheKey, info, ttlSeconds);
-      logger.debug('Video cached', { videoId, ttlSeconds, requestId });
-    } catch (cacheErr) {
-      logger.error('Video caching failed', { videoId, requestId, error: cacheErr });
-    }
+    // 3) Fetch -> Persist -> Cache (singleflight + distributed lock)
+    const fetchKey = cacheKey;
+    const lockKey = `${fetchKey}:_lock`;
+    const startWaitMs = 5000;
+    const info = await singleflightFetch(fetchKey, async () => {
+      const token = await redisAcquireLock(lockKey, Math.max(10000, ttlSeconds * 1000));
+      if (!token) {
+        const waited = await redisWaitForKey<any>(fetchKey, startWaitMs, 100);
+        if (waited) return waited;
+        // Fall through without lock
+        const r = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
+        try { await upsertVideo(r); } catch {}
+        try { await redisSetJson(fetchKey, r, jitterTtl(ttlSeconds)); } catch {}
+        return r;
+      }
+      try {
+        const r = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
+        try { await upsertVideo(r); } catch {}
+        try { await redisSetJson(fetchKey, r, jitterTtl(ttlSeconds)); } catch {}
+        return r;
+      } finally {
+        try { await redisReleaseLock(lockKey, token); } catch {}
+      }
+    });
 
     return c.json(info);
   } catch (err) {
@@ -94,6 +151,11 @@ v1InnertubeVideoRouter.get('/', async (c: Context<AppSchema>) => {
       return c.json({ error: 'Client Closed Request', code: ERROR_CODES.CLIENT_CLOSED_REQUEST }, STATUS_CLIENT_CLOSED_REQUEST as any);
     }
     const mapped = mapErrorToHttp(err);
+    // Negative cache for 4xx to reduce repeated work
+    if (mapped.status >= 400 && mapped.status < 500) {
+      const neg = { error: mapped.message || 'Bad Request', code: ERROR_CODES.BAD_REQUEST, __err: true, __status: mapped.status };
+      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch {}
+    }
     logger.error('Error in /v1/innertube/video', { err, mapped, videoId, requestId });
     return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
   }

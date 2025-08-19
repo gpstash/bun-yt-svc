@@ -100,7 +100,14 @@ export async function getCaptionByVideoAndLanguage(videoId: string, language: st
     return null;
   }
   const rows = await db
-    .select()
+    .select({
+      videoId: captions.videoId,
+      language: captions.language,
+      targetLanguage: captions.targetLanguage,
+      segments: captions.segments as any,
+      words: captions.words as any,
+      updatedAt: captions.updatedAt,
+    })
     .from(captions)
     .where(
       and(
@@ -110,7 +117,7 @@ export async function getCaptionByVideoAndLanguage(videoId: string, language: st
       )
     )
     .limit(1);
-  const row = rows[0] as CaptionRow | undefined;
+  const row = rows[0] as any as CaptionRow | undefined;
   if (!row) return null;
   return {
     videoId: row.videoId,

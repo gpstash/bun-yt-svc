@@ -94,16 +94,21 @@ export async function getTranscriptByVideoAndLanguage(videoId: string, language:
     return null;
   }
   const rows = await db
-    .select()
+    .select({
+      videoId: transcripts.videoId,
+      language: transcripts.language,
+      segments: transcripts.segments as any,
+      updatedAt: transcripts.updatedAt,
+    })
     .from(transcripts)
     .where(and(eq(transcripts.videoId, videoId), eq(transcripts.language, language)))
     .limit(1);
   const row = rows[0] as TranscriptRow | undefined;
   if (!row) return null;
   return {
-    videoId: row.videoId,
-    language: row.language,
-    segments: row.segments as any,
-    updatedAt: row.updatedAt,
+    videoId: (row as any).videoId,
+    language: (row as any).language,
+    segments: (row as any).segments,
+    updatedAt: (row as any).updatedAt,
   } as TranscriptRecord;
 }
