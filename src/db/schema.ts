@@ -1,4 +1,4 @@
-import { pgTable, text, boolean, integer, bigint, jsonb, timestamp, pgSchema } from 'drizzle-orm/pg-core';
+import { text, boolean, integer, bigint, jsonb, timestamp, pgSchema, uniqueIndex } from 'drizzle-orm/pg-core';
 
 // Use custom PostgreSQL schema: "yt-svc"
 const ytSvc = pgSchema('yt-svc');
@@ -28,3 +28,18 @@ export const videos = ytSvc.table('videos', {
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
+
+// Store full transcript payloads keyed by video + language
+export const transcripts = ytSvc.table('transcripts', {
+  videoId: text('video_id').notNull().references(() => videos.id, { onDelete: 'cascade', onUpdate: 'cascade' }),
+  language: text('language').notNull(),
+  segments: jsonb('segments').$type<Array<{ text: string; start: number; end: number }>>().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+}, (t) => {
+  return {
+    // Ensure one row per (videoId, language)
+    uniq: uniqueIndex('transcripts_video_language_unique').on(t.videoId, t.language),
+  };
+});
+

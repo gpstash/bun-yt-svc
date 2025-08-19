@@ -69,7 +69,6 @@ export interface TranscriptSegment {
 
 export interface ParsedVideoInfoWithTranscript extends ParsedVideoInfo {
   transcript: {
-    hasTranscript: boolean;
     language: string;
     segments: TranscriptSegment[];
     text: string;
@@ -248,7 +247,6 @@ export function parseTranscript(parsedVideoInfo: ParsedVideoInfo, selectedTransc
   }
 
   const text = textParts.join(' ');
-  const hasTranscript = Boolean(segments.length > 0 || (text && text.trim().length > 0));
   // Remove transcript baseUrl from base
   parsedVideoInfo.captionLanguages = parsedVideoInfo.captionLanguages.map((language) => {
     return {
@@ -259,7 +257,6 @@ export function parseTranscript(parsedVideoInfo: ParsedVideoInfo, selectedTransc
   return {
     ...parsedVideoInfo,
     transcript: {
-      hasTranscript,
       language: selectedTranscript?.selectedLanguage ?? "",
       segments,
       text,

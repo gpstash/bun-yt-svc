@@ -192,7 +192,6 @@ export class InnertubeService {
       return {
         ...parsedVideoInfo,
         transcript: {
-          hasTranscript: false,
           language: "",
           segments: [],
           text: "",
@@ -632,10 +631,12 @@ export class InnertubeService {
       ...InnertubeService.DEFAULT_HTTP_OPTIONS,
       ...(isProxyNeeded ? { useProxy: true } : {}),
       // Extend retry behavior for transcript endpoint to also retry on 400 FAILED_PRECONDITION
-      ...(isTranscript ? { retryOnStatus: [
-        ...(InnertubeService.DEFAULT_HTTP_OPTIONS.retryOnStatus ?? []),
-        400,
-      ] } : {}),
+      ...(isTranscript ? {
+        retryOnStatus: [
+          ...(InnertubeService.DEFAULT_HTTP_OPTIONS.retryOnStatus ?? []),
+          400,
+        ]
+      } : {}),
       // Player endpoint is heavy (download + parse). Allow longer timeout.
       ...(isPlayerEndpoint ? { timeoutMs: Math.max(20000, InnertubeService.DEFAULT_HTTP_OPTIONS.timeoutMs ?? 0) } : {}),
       signal: compositeSignal,
