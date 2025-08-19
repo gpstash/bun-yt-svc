@@ -9,8 +9,9 @@ export const configSchema = z.object({
   PROXY_PASSWORD: z.string().default(''),
   PROXY_STATUS: z.enum(['active', 'inactive']).default('inactive'),
   REDIS_URL: z.string().default('redis://localhost:6379'),
-  VIDEO_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 4),
-  TRANSCRIPT_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 4),
+  VIDEO_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 4), // 4 hours
+  TRANSCRIPT_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24), // 1 day
+  CAPTION_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24), // 1 day
 });
 
 export type AppConfig = z.infer<typeof configSchema>;

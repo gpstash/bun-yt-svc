@@ -43,3 +43,19 @@ export const transcripts = ytSvc.table('transcripts', {
   };
 });
 
+
+// Store full caption payloads keyed by video + language, with segments and words
+export const captions = ytSvc.table('captions', {
+  videoId: text('video_id').notNull().references(() => videos.id, { onDelete: 'cascade', onUpdate: 'cascade' }),
+  language: text('language').notNull(),
+  targetLanguage: text('target_language'),
+  segments: jsonb('segments').$type<Array<{ text: string; start: number; end: number }>>().notNull(),
+  words: jsonb('words').$type<Array<{ text: string; start: number; end: number }>>().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+}, (t) => {
+  return {
+    uniq: uniqueIndex('captions_video_language_target_unique').on(t.videoId, t.language, t.targetLanguage),
+  };
+});
+

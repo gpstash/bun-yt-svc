@@ -14,6 +14,13 @@
       "version": "7",
       "when": 1755576426112,
       "tag": "0001_transcripts_table",
+      "breakpoints": false
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1755586067453,
+      "tag": "0002_captions_table",
       "breakpoints": true
     }
   ]
