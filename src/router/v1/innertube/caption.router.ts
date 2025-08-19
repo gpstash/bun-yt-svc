@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
 import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegativeCache } from '@/lib/cache.util';
 import { getCaptionByVideoAndLanguage, hasCaptionLanguage, getPreferredCaptionLanguage, upsertCaption } from '@/service/caption.service';
+import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
 import { getVideoById, upsertVideo } from '@/service/video.service';
 
 export const v1InnertubeCaptionRouter = new Hono<AppSchema>();
@@ -140,6 +141,70 @@ async function fetchPersistAndCache(c: Context<AppSchema>, videoId: string, effe
   } catch (cacheErr) {
     logger.error('Caption caching failed', { videoId, language: resolvedLang, requestId, error: cacheErr });
     return { info, resolvedLang } as const;
+  }
+}
+
+// Minimal per-id worker for batch: resolve lang -> cache -> fetch/persist/cache
+async function batchFetchOne(
+  c: Context<AppSchema>,
+  videoId: string,
+  requestedLang: string | undefined | null,
+  translateLanguage: string | undefined | null,
+) {
+  const requestId = c.get('requestId');
+  const { effectiveLang } = await resolveEffectiveLanguage(videoId, requestedLang, requestId);
+  const cacheKey = buildCacheKey(videoId, effectiveLang, translateLanguage);
+  const ttlSeconds = c.get('config').CAPTION_CACHE_TTL_SECONDS;
+
+  // Cache first
+  const cached = await redisGetJson<any>(cacheKey).catch(() => undefined);
+  if (cached) {
+    logger.info('Batch cache hit for caption', { videoId, language: effectiveLang, translateLanguage, requestId });
+    if (isNegativeCache(cached)) return { __error: true, error: cached.error, code: cached.code, __status: (cached as any).__status ?? 400 };
+    return { data: cached };
+  }
+  logger.debug('Batch cache miss for caption', { videoId, language: effectiveLang, translateLanguage, requestId, cacheKey });
+
+  // DB next: if fresh within TTL, assemble and return
+  try {
+    const dbRes = await getCaptionByVideoAndLanguage(videoId, effectiveLang || '', translateLanguage ?? null);
+    if (dbRes) {
+      const now = Date.now();
+      const updatedAtMs = new Date(dbRes.updatedAt).getTime();
+      const ageSeconds = Math.max(0, Math.floor((now - updatedAtMs) / 1000));
+      if (ageSeconds < ttlSeconds) {
+        const remaining = Math.max(1, ttlSeconds - ageSeconds);
+        const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, translateLanguage, requestId);
+        logger.info('Batch DB hit within TTL for caption', { videoId, language: dbRes.language, targetLanguage: translateLanguage ?? null, ageSeconds, remaining, requestId });
+        if (!requestedLang && !translateLanguage) { try { await setAlias(videoId, dbRes.language, remaining); logger.debug('Batch alias set from DB (caption)', { videoId, language: dbRes.language, remaining, requestId }); } catch { /* noop */ } }
+        return { data: assembled };
+      }
+      logger.info('Batch DB hit but stale for caption; will fetch', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, ageSeconds, ttlSeconds, requestId });
+    }
+  } catch (dbErr) {
+    logger.error('DB check for caption (batch) failed; continuing to fetch', { videoId, language: effectiveLang, translateLanguage, requestId, error: dbErr });
+  }
+
+  // Fetch -> persist -> cache (singleflight + distributed lock)
+  try {
+    logger.info('Batch fetching caption from upstream', { videoId, language: effectiveLang, translateLanguage, requestId });
+    const res = await singleflight(cacheKey, async () => {
+      return await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
+        return await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
+      });
+    });
+    const { info, resolvedLang } = res;
+    if (!requestedLang && !translateLanguage) {
+      try { await setAlias(videoId, resolvedLang, ttlSeconds); logger.debug('Batch alias set from fetch (caption)', { videoId, language: resolvedLang, ttlSeconds, requestId }); } catch { /* noop */ }
+    }
+    return { data: info };
+  } catch (e) {
+    const mapped = mapErrorToHttp(e);
+    if (mapped.status >= 400 && mapped.status < 500) {
+      const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
+      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); logger.debug('Batch negative-cache set for caption', { videoId, language: effectiveLang, translateLanguage, status: mapped.status, code: mapped.code, requestId }); } catch { /* noop */ }
+    }
+    return { __error: true, error: mapped.message || 'Internal Server Error', code: mapped.code, __status: mapped.status };
   }
 }
 
@@ -297,4 +362,33 @@ v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
     logger.error('Error in /v1/innertube/caption', { err, mapped, videoId, language: effectiveLang, requestId });
     return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
   }
+});
+
+// POST /v1/innertube/caption/batch
+v1InnertubeCaptionRouter.post('/batch', async (c: Context<AppSchema>) => {
+  const requestId = c.get('requestId');
+  const BodySchema = z.object({
+    ids: z.array(z.string().trim().min(1)).min(1, 'ids cannot be empty'),
+    l: z.string().trim().optional(),
+    tl: z.string().trim().optional(),
+  });
+  const parsed = BodySchema.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    logger.warn('Invalid body for caption batch', { issues: parsed.error.issues, requestId });
+    return c.json({ error: first?.message || 'Bad Request', code: ERROR_CODES.BAD_REQUEST }, 400);
+  }
+  const { ids, l, tl } = parsed.data;
+
+  const throttle = readBatchThrottle(c);
+  const results = await throttleMap(ids, async (id) => {
+    return await batchFetchOne(c, id, l ?? undefined, tl ?? undefined);
+  }, throttle);
+
+  const out: Record<string, any> = {};
+  ids.forEach((id, i) => {
+    const r = results[i];
+    out[id] = r?.__error ? { error: r.error, code: r.code, __status: r.__status } : r?.data ?? null;
+  });
+  return c.json(out);
 });

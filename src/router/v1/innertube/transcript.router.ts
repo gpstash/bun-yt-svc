@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
 import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegativeCache } from '@/lib/cache.util';
 import { getTranscriptByVideoAndLanguage, upsertTranscript, getPreferredTranscriptLanguage, hasTranscriptLanguage } from '@/service/transcript.service';
+import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
 import { getVideoById, upsertVideo } from '@/service/video.service';
 
 export const v1InnertubeTranscriptRouter = new Hono<AppSchema>();
@@ -43,7 +44,6 @@ async function resolveEffectiveLanguage(videoId: string, requestedLang: string |
         logger.info('Requested language not available, falling back to preferred', { videoId, requestedLang, fallback: preferred, requestId });
         return { effectiveLang: preferred, source: 'fallback' };
       }
-      // If no preferred, fall through to alias/oldest/default below
     } catch (e) {
       logger.warn('Failed checking requested language availability; proceeding with other resolution', { videoId, requestedLang, requestId, error: e });
     }
@@ -137,6 +137,70 @@ async function fetchPersistAndCache(c: Context<AppSchema>, videoId: string, effe
   } catch (cacheErr) {
     logger.error('Transcript caching failed', { videoId, language: resolvedLang, requestId, error: cacheErr });
     return { info, resolvedLang } as const;
+  }
+}
+
+// Minimal per-id worker for batch transcripts
+async function batchFetchOne(
+  c: Context<AppSchema>,
+  videoId: string,
+  requestedLang: string | undefined | null,
+) {
+  const requestId = c.get('requestId');
+  const { effectiveLang } = await resolveEffectiveLanguage(videoId, requestedLang, requestId);
+  const cacheKey = buildCacheKey(videoId, effectiveLang);
+  const ttlSeconds = c.get('config').TRANSCRIPT_CACHE_TTL_SECONDS;
+
+  const cached = await redisGetJson<any>(cacheKey).catch(() => undefined);
+  if (cached) {
+    logger.info('Batch cache hit for transcript', { videoId, language: effectiveLang, requestId });
+    if (isNegativeCache(cached)) return { __error: true, error: cached.error, code: cached.code, __status: (cached as any).__status ?? 400 };
+    return { data: cached };
+  }
+  logger.debug('Batch cache miss for transcript', { videoId, language: effectiveLang, requestId, cacheKey });
+
+  // DB next: if fresh within TTL, assemble and return
+  try {
+    const dbRes = await getTranscriptByVideoAndLanguage(videoId, effectiveLang || '');
+    if (dbRes) {
+      const now = Date.now();
+      const updatedAtMs = new Date(dbRes.updatedAt).getTime();
+      const ageSeconds = Math.max(0, Math.floor((now - updatedAtMs) / 1000));
+      if (ageSeconds < ttlSeconds) {
+        const remaining = Math.max(1, ttlSeconds - ageSeconds);
+        const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, requestId);
+        logger.info('Batch DB hit within TTL for transcript', { videoId, language: dbRes.language, ageSeconds, remaining, requestId });
+        if (!requestedLang) { try { await setAlias(videoId, dbRes.language, remaining); logger.debug('Batch alias set from DB (transcript)', { videoId, language: dbRes.language, remaining, requestId }); } catch { /* noop */ } }
+        return { data: assembled };
+      }
+      logger.info('Batch DB hit but stale for transcript; will fetch', { videoId, language: effectiveLang, ageSeconds, ttlSeconds, requestId });
+    }
+  } catch (dbErr) {
+    logger.error('DB check for transcript (batch) failed; continuing to fetch', { videoId, language: effectiveLang, requestId, error: dbErr });
+  }
+
+  try {
+    logger.info('Batch fetching transcript from upstream', { videoId, language: effectiveLang, requestId });
+    const { info, resolvedLang } = await singleflight(cacheKey, async () => {
+      return await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
+        return await fetchPersistAndCache(c, videoId, effectiveLang, ttlSeconds, requestId);
+      });
+    });
+    if (!requestedLang) { try { await setAlias(videoId, resolvedLang, ttlSeconds); logger.debug('Batch alias set from fetch (transcript)', { videoId, language: resolvedLang, ttlSeconds, requestId }); } catch { /* noop */ } }
+    return { data: info };
+  } catch (e) {
+    const mapped = mapErrorToHttp(e);
+    const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode>([
+      ERROR_CODES.INVALID_LANGUAGE,
+      ERROR_CODES.INVALID_TRANSLATE_LANGUAGE,
+      ERROR_CODES.YT_TRANSLATION_UNSUPPORTED,
+      ERROR_CODES.YT_TRANSLATION_SAME_LANGUAGE,
+    ]);
+    if (mapped.status >= 400 && mapped.status < 500 && LANG_RELATED_CODES.has(mapped.code)) {
+      const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
+      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); logger.debug('Batch negative-cache set for transcript', { videoId, language: effectiveLang, status: mapped.status, code: mapped.code, requestId }); } catch { /* noop */ }
+    }
+    return { __error: true, error: mapped.message || 'Internal Server Error', code: mapped.code, __status: mapped.status };
   }
 }
 
@@ -261,6 +325,62 @@ v1InnertubeTranscriptRouter.get('/', async (c: Context<AppSchema>) => {
       try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch {}
     }
     logger.error('Error in /v1/innertube/transcript', { err, mapped, videoId, language: effectiveLang, requestId });
+    return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
+  }
+});
+
+// POST /v1/innertube/transcript/batch
+v1InnertubeTranscriptRouter.post('/batch', async (c: Context<AppSchema>) => {
+  const requestId = c.get('requestId');
+
+  const BodySchema = z
+    .object({
+      ids: z.array(z.string().trim().min(1, 'Invalid video id')).min(1, 'ids must not be empty').max(50, 'Max 50 ids per request'),
+      l: z.string().trim().optional(),
+    })
+    .superRefine((val, ctx) => {
+      if (val.l !== undefined) {
+        const candidate = val.l.trim();
+        if (candidate.length === 0 || candidate.length > 100) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l'], message: 'Invalid language' });
+        }
+      }
+    });
+
+  let body: unknown;
+  try { body = await c.req.json(); }
+  catch { return c.json({ error: 'Invalid JSON body', code: ERROR_CODES.BAD_REQUEST }, 400); }
+
+  const parsed = BodySchema.safeParse(body);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    logger.warn('Invalid body for /v1/innertube/transcript/batch', { issues: parsed.error.issues, requestId });
+    return c.json({ error: first?.message || 'Bad Request', code: ERROR_CODES.BAD_REQUEST }, 400);
+  }
+
+  const seen = new Set<string>();
+  const ids = parsed.data.ids.filter((id) => !seen.has(id) && (seen.add(id), true));
+  const l = parsed.data.l ?? undefined;
+
+  try {
+    const results: Record<string, any> = {};
+    const cfg = c.get('config');
+    const { concurrency, minDelayMs, maxDelayMs } = readBatchThrottle(cfg, { maxConcurrency: 5, minDelayFloorMs: 50 });
+
+    await throttleMap(
+      ids,
+      async (id) => {
+        const r = await batchFetchOne(c, id, l);
+        results[id] = (r as any).__error ? { error: (r as any).error, code: (r as any).code } : (r as any).data;
+      },
+      { concurrency, minDelayMs, maxDelayMs, signal: c.get('signal') }
+    );
+
+    logger.info('Transcript batch processed', { count: ids.length, requestId });
+    return c.json(results);
+  } catch (err) {
+    const mapped = mapErrorToHttp(err);
+    logger.error('Error in /v1/innertube/transcript/batch', { err, mapped, requestId });
     return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
   }
 });

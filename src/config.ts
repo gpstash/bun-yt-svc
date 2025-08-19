@@ -12,6 +12,10 @@ export const configSchema = z.object({
   VIDEO_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 4), // 4 hours
   TRANSCRIPT_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24), // 1 day
   CAPTION_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24), // 1 day
+  // Batch throttling controls for safe crawling
+  INNERTUBE_BATCH_CONCURRENCY: z.coerce.number().int().positive().max(10).default(3),
+  INNERTUBE_BATCH_MIN_DELAY_MS: z.coerce.number().int().positive().default(150),
+  INNERTUBE_BATCH_MAX_DELAY_MS: z.coerce.number().int().positive().default(400),
 });
 
 export type AppConfig = z.infer<typeof configSchema>;
