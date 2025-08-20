@@ -5,12 +5,14 @@ import { configMiddleware } from '@/middleware/config.middleware';
 import { v1RootRouter } from '@/router/v1/root.router';
 import type { InnertubeService } from '@/service/innertube.service';
 import type { Context } from 'hono';
+import type { YTNodes } from 'youtubei.js';
 
 export interface AppVariables {
   config: AppConfig;
   innertubeSvc: InnertubeService;
   signal: AbortSignal;
   requestId: string;
+  navigationEndpoint?: YTNodes.NavigationEndpoint;
 }
 
 export interface AppSchema {

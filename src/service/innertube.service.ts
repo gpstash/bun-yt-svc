@@ -1,5 +1,5 @@
-import { createLogger, getLogLevel, LogLevel } from "@/lib/logger.lib";
-import { ClientType, Innertube, Log, UniversalCache, YT } from "youtubei.js";
+import { createLogger } from "@/lib/logger.lib";
+import { ClientType, Innertube, Log, UniversalCache, YT, YTNodes } from "youtubei.js";
 import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedVideoInfoWithTranscript, finCaptionByLanguageCode, ParsedVideoInfoWithCaption } from "@/helper/video.helper";
 import { decodeJson3Caption, buildParsedVideoInfoWithCaption } from "@/helper/caption.helper";
 import { http, HttpOptions } from "@/lib/http.lib";
@@ -48,6 +48,10 @@ export class InnertubeService {
   private static readonly MAX_PLAYABILITY_ATTEMPTS = 3;
   // Maximum jitter cap used in our retry backoff helper
   private static readonly MAX_BACKOFF_JITTER_MS = 600;
+
+  public getInnertube(): Innertube {
+    return this.innertube;
+  }
 
   /**
    * Fetch and parse video information with a normalized shape safe for clients.
