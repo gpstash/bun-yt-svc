@@ -11,6 +11,8 @@ import { getCaptionByVideoAndLanguage, hasCaptionLanguage, getPreferredCaptionLa
 import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
 import { getVideoById, upsertVideo } from '@/service/video.service';
 import { InnertubeService } from '@/service/innertube.service';
+import { navigationMiddleware } from '@/middleware/navigation.middleware';
+import { navigationBatchMiddleware } from '@/middleware/navigation-batch.middleware';
 
 export const v1InnertubeCaptionRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:caption');
@@ -145,30 +147,49 @@ async function fetchPersistAndCache(c: Context<AppSchema>, videoId: string, effe
   }
 }
 
-// Minimal per-id worker for batch: resolve lang -> cache -> fetch/persist/cache
-async function batchFetchOne(
+type FetchOptions = { swrOnStale?: boolean };
+
+// Unified single-item resolver used by both GET and batch routes
+async function fetchOne(
   c: Context<AppSchema>,
   videoId: string,
   requestedLang: string | undefined | null,
   translateLanguage: string | undefined | null,
+  opts: FetchOptions = { swrOnStale: false }
 ) {
   const requestId = c.get('requestId');
   const { effectiveLang } = await resolveEffectiveLanguage(videoId, requestedLang, requestId);
   const cacheKey = buildCacheKey(videoId, effectiveLang, translateLanguage);
   const ttlSeconds = c.get('config').CAPTION_CACHE_TTL_SECONDS;
 
-  // Cache first
+  // Early translate-language validation from video metadata when available
+  if (translateLanguage) {
+    try {
+      const videoDb = await getVideoById(videoId);
+      const tlList: Array<{ languageCode: string }> = (videoDb?.video?.captionTranslationLanguages ?? []) as any;
+      const srcList: Array<{ languageCode: string; isTranslatable?: boolean }> = (videoDb?.video?.captionLanguages ?? []) as any;
+      const tlOk = Array.isArray(tlList) && tlList.some(t => (t.languageCode || '').toLowerCase() === translateLanguage.toLowerCase());
+      const src = Array.isArray(srcList) ? srcList.find(s => (s.languageCode || '').toLowerCase() === (effectiveLang || '').toLowerCase()) : undefined;
+      const srcOk = !src || src.isTranslatable !== false; // assume ok if unknown
+      if (!tlOk || !srcOk) {
+        return { __error: true, error: 'Invalid translate language', code: ERROR_CODES.INVALID_TRANSLATE_LANGUAGE, __status: 400 } as const;
+      }
+    } catch {/* ignore and proceed */}
+  }
+
+  // 1) Cache first
   const cached = await redisGetJson<any>(cacheKey).catch(() => undefined);
   if (cached) {
-    logger.info('Batch cache hit for caption', { videoId, language: effectiveLang, translateLanguage, requestId });
-    if (isNegativeCache(cached)) return { __error: true, error: cached.error, code: cached.code, __status: (cached as any).__status ?? 400 };
+    logger.info('Cache hit for caption', { videoId, language: effectiveLang, translateLanguage, requestId, cacheKey });
+    if (isNegativeCache(cached)) {
+      return { __error: true, error: cached.error, code: cached.code, __status: (cached as any).__status ?? 400 };
+    }
     return { data: cached };
   }
-  logger.debug('Batch cache miss for caption', { videoId, language: effectiveLang, translateLanguage, requestId, cacheKey });
 
-  // DB next: if fresh within TTL, assemble and return
+  // 2) DB next
   try {
-    const dbRes = await getCaptionByVideoAndLanguage(videoId, effectiveLang || '', translateLanguage ?? null);
+    const dbRes = await getCaptionByVideoAndLanguage(videoId, effectiveLang, translateLanguage ?? null);
     if (dbRes) {
       const now = Date.now();
       const updatedAtMs = new Date(dbRes.updatedAt).getTime();
@@ -176,42 +197,61 @@ async function batchFetchOne(
       if (ageSeconds < ttlSeconds) {
         const remaining = Math.max(1, ttlSeconds - ageSeconds);
         const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, translateLanguage, requestId);
-        logger.info('Batch DB hit within TTL for caption', { videoId, language: dbRes.language, targetLanguage: translateLanguage ?? null, ageSeconds, remaining, requestId });
-        if (!requestedLang && !translateLanguage) { try { await setAlias(videoId, dbRes.language, remaining); logger.debug('Batch alias set from DB (caption)', { videoId, language: dbRes.language, remaining, requestId }); } catch { /* noop */ } }
+        logger.info('DB hit within TTL for caption', { videoId, language: dbRes.language, targetLanguage: translateLanguage ?? null, ageSeconds, remaining, requestId });
+        if (!requestedLang && !translateLanguage) { try { await setAlias(videoId, dbRes.language, remaining); } catch { /* noop */ } }
         return { data: assembled };
       }
-      logger.info('Batch DB hit but stale for caption; will fetch', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, ageSeconds, ttlSeconds, requestId });
+      // SWR mode: return stale and refresh in background
+      if (opts.swrOnStale) {
+        const remaining = 60;
+        const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, translateLanguage, requestId);
+        logger.info('DB hit but stale; serving stale and refreshing in background (caption)', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, ageSeconds, ttlSeconds, requestId });
+        const bgKey = buildCacheKey(videoId, effectiveLang, translateLanguage);
+        void (async () => {
+          try {
+            const { resolvedLang } = await fetchWithRedisLock(bgKey, ttlSeconds, async () => {
+              return await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
+            });
+            if (!requestedLang && !translateLanguage) {
+              try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch { /* noop */ }
+            }
+          } catch (e) {
+            const mapped = mapErrorToHttp(e);
+            if (mapped.status >= 400 && mapped.status < 500) {
+              const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
+              try { await redisSetJson(bgKey, neg, jitterTtl(60)); } catch { /* noop */ }
+            }
+          }
+        })();
+        return { data: assembled };
+      }
     }
   } catch (dbErr) {
-    logger.error('DB check for caption (batch) failed; continuing to fetch', { videoId, language: effectiveLang, translateLanguage, requestId, error: dbErr });
+    logger.error('DB check for caption failed; will fetch', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, requestId, error: dbErr });
   }
 
-  // Fetch -> persist -> cache (singleflight + distributed lock)
+  // 3) Fetch -> persist -> cache
   try {
-    logger.info('Batch fetching caption from upstream', { videoId, language: effectiveLang, translateLanguage, requestId });
     const res = await singleflight(cacheKey, async () => {
       return await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
         return await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
       });
     });
     const { info, resolvedLang } = res;
-    if (!requestedLang && !translateLanguage) {
-      try { await setAlias(videoId, resolvedLang, ttlSeconds); logger.debug('Batch alias set from fetch (caption)', { videoId, language: resolvedLang, ttlSeconds, requestId }); } catch { /* noop */ }
-    }
+    if (!requestedLang && !translateLanguage) { try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch { /* noop */ } }
     return { data: info };
   } catch (e) {
     const mapped = mapErrorToHttp(e);
     if (mapped.status >= 400 && mapped.status < 500) {
       const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); logger.debug('Batch negative-cache set for caption', { videoId, language: effectiveLang, translateLanguage, status: mapped.status, code: mapped.code, requestId }); } catch { /* noop */ }
+      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch { /* noop */ }
     }
     return { __error: true, error: mapped.message || 'Internal Server Error', code: mapped.code, __status: mapped.status };
   }
 }
 
-v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
+v1InnertubeCaptionRouter.get('/', navigationMiddleware(), async (c: Context<AppSchema>) => {
   const requestId = c.get('requestId');
-  const rawId = c.req.query('v');
   const l = c.req.query('l');
   const tl = c.req.query('tl');
   // Only negative-cache these language-related 4xx codes
@@ -223,7 +263,6 @@ v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
   ]);
 
   const QuerySchema = z.object({
-    v: z.string().trim().min(1, 'Missing video id'),
     l: z.string().trim().optional(),
     tl: z.string().trim().optional(),
   }).superRefine((val, ctx) => {
@@ -241,145 +280,84 @@ v1InnertubeCaptionRouter.get('/', async (c: Context<AppSchema>) => {
     }
   });
 
-  const parsed = QuerySchema.safeParse({ v: rawId, l, tl });
+  const parsed = QuerySchema.safeParse({ l, tl });
   if (!parsed.success) {
     const first = parsed.error.issues[0];
     const key = String(first.path[0] || '');
-    const code = key === 'v'
-      ? ERROR_CODES.BAD_REQUEST
-      : key === 'tl'
-        ? ERROR_CODES.INVALID_TRANSLATE_LANGUAGE
-        : ERROR_CODES.INVALID_LANGUAGE;
+    const code = key === 'tl' ? ERROR_CODES.INVALID_TRANSLATE_LANGUAGE : ERROR_CODES.INVALID_LANGUAGE;
     const msg = first.message || 'Bad Request';
     logger.warn('Invalid query parameters for /v1/innertube/caption', { issues: parsed.error.issues, requestId });
     return c.json({ error: msg, code }, 400);
   }
 
-  const videoId = parsed.data.v;
-  const requestedLang = parsed.data.l ?? '';
-  const translateLanguage = parsed.data.tl ?? undefined;
-  const { effectiveLang } = await resolveEffectiveLanguage(videoId, requestedLang, requestId);
-  // Early translate-language validation from video metadata when available
-  if (translateLanguage) {
-    try {
-      const videoDb = await getVideoById(videoId);
-      const tlList: Array<{ languageCode: string }> = (videoDb?.video?.captionTranslationLanguages ?? []) as any;
-      const srcList: Array<{ languageCode: string; isTranslatable?: boolean }> = (videoDb?.video?.captionLanguages ?? []) as any;
-      const tlOk = Array.isArray(tlList) && tlList.some(t => (t.languageCode || '').toLowerCase() === translateLanguage.toLowerCase());
-      const src = Array.isArray(srcList) ? srcList.find(s => (s.languageCode || '').toLowerCase() === (effectiveLang || '').toLowerCase()) : undefined;
-      const srcOk = !src || src.isTranslatable !== false; // assume ok if unknown
-      if (!tlOk || !srcOk) {
-        logger.warn('Early reject invalid or unsupported translate language', { videoId, effectiveLang, translateLanguage, tlOk, srcOk, requestId });
-        return c.json({ error: 'Invalid translate language', code: ERROR_CODES.INVALID_TRANSLATE_LANGUAGE }, 400);
-      }
-    } catch (e) {
-      logger.debug('Early translate-language validation skipped due to DB read error', { videoId, requestId, error: e });
-    }
-  }
-  const cacheKey = buildCacheKey(videoId, effectiveLang, translateLanguage);
-  const ttlSeconds = c.get('config').CAPTION_CACHE_TTL_SECONDS;
+  const navigationEndpoint = c.get('navigationEndpoint') as any;
+  const videoId = navigationEndpoint?.payload?.videoId as string | undefined;
+  if (!videoId) return c.json({ error: 'Missing video id', code: ERROR_CODES.BAD_REQUEST }, 400);
 
   try {
-    // 1) Cache first
-    const cached = await redisGetJson<any>(cacheKey);
-    if (cached) {
-      logger.info('Cache hit for caption', { videoId, language: effectiveLang, translateLanguage, requestId, cacheKey });
-      if (isNegativeCache(cached)) {
-        return c.json({ error: cached.error, code: cached.code }, (cached.__status as any) ?? 400);
-      }
-      return c.json(cached);
+    const r = await fetchOne(c, videoId, l ?? '', tl ?? undefined, { swrOnStale: true });
+    if ((r as any).__error) {
+      const status = (r as any).__status ?? 400;
+      return c.json({ error: (r as any).error, code: (r as any).code }, status as any);
     }
-
-    // 2) DB next (now includes translated captions by targetLanguage)
-    try {
-      const dbRes = await getCaptionByVideoAndLanguage(videoId, effectiveLang, translateLanguage ?? null);
-      if (dbRes) {
-        const now = Date.now();
-        const updatedAtMs = new Date(dbRes.updatedAt).getTime();
-        const ageSeconds = Math.max(0, Math.floor((now - updatedAtMs) / 1000));
-        if (ageSeconds < ttlSeconds) {
-          const remaining = Math.max(1, ttlSeconds - ageSeconds);
-          const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, translateLanguage, requestId);
-          logger.info('DB hit within TTL for caption', { videoId, language: dbRes.language, targetLanguage: translateLanguage ?? null, ageSeconds, remaining, requestId });
-          if (!requestedLang && !translateLanguage) {
-            try { await setAlias(videoId, dbRes.language, remaining); } catch { /* noop */ }
-          }
-          return c.json(assembled);
-        }
-        // SWR: serve stale, refresh in background
-        const remaining = 60; // brief cache to avoid thundering herd while background refresh runs
-        const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, translateLanguage, requestId);
-        logger.info('DB hit but stale; serving stale and refreshing in background', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, ageSeconds, ttlSeconds, requestId });
-        const bgKey = buildCacheKey(videoId, effectiveLang, translateLanguage);
-        // Fire-and-forget background refresh with distributed lock
-        void (async () => {
-          try {
-            const { resolvedLang } = await fetchWithRedisLock(bgKey, ttlSeconds, async () => {
-              return await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
-            });
-            if (!requestedLang && !translateLanguage) {
-              try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch { }
-            }
-          } catch (e) {
-            const mapped = mapErrorToHttp(e);
-            if (mapped.status >= 400 && mapped.status < 500 && LANG_RELATED_CODES.has(mapped.code)) {
-              const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-              try { await redisSetJson(bgKey, neg, jitterTtl(60)); } catch { }
-            }
-          }
-        })();
-        return c.json(assembled);
-      } else {
-        logger.debug('DB miss for caption', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, requestId });
-      }
-    } catch (dbErr) {
-      logger.error('DB check for caption failed; continuing to fetch from YouTube', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, requestId, error: dbErr });
-    }
-
-    // 3) Fetch -> Persist -> Cache (singleflight + distributed lock to dedupe across instances)
-    const fetchKey = buildCacheKey(videoId, effectiveLang, translateLanguage);
-    const res = await singleflight(fetchKey, async () => {
-      return await fetchWithRedisLock(fetchKey, ttlSeconds, async () => {
-        return await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
-      });
-    });
-    const { info, resolvedLang } = res;
-    if (!requestedLang && !translateLanguage) {
-      try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch { /* noop */ }
-    }
-    return c.json(info);
+    return c.json((r as any).data);
   } catch (err) {
     const isAbort = isClientAbort(err) || (err instanceof HttpError && (err as HttpError).code === 'EABORT');
     if (isAbort) {
-      logger.info('Request aborted by client', { videoId, language: effectiveLang, requestId });
+      logger.info('Request aborted by client', { videoId, requestId });
       return c.json({ error: 'Client Closed Request', code: ERROR_CODES.CLIENT_CLOSED_REQUEST }, STATUS_CLIENT_CLOSED_REQUEST as any);
     }
-    // Negative cache only for language-related 4xx to reduce repeated work
-    let mapped = mapErrorToHttp(err);
-    if (mapped.status >= 400 && mapped.status < 500 && LANG_RELATED_CODES.has(mapped.code)) {
-      const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch { }
-    }
-    logger.error('Error in /v1/innertube/caption', { err, mapped, videoId, language: effectiveLang, requestId });
+    const mapped = mapErrorToHttp(err);
+    logger.error('Error in /v1/innertube/caption', { err, mapped, videoId, requestId });
     return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
   }
 });
 
 // POST /v1/innertube/caption/batch
-v1InnertubeCaptionRouter.post('/batch', async (c: Context<AppSchema>) => {
+v1InnertubeCaptionRouter.post('/batch', navigationBatchMiddleware(), async (c: Context<AppSchema>) => {
   const requestId = c.get('requestId');
-  const BodySchema = z.object({
-    ids: z.array(z.string().trim().min(1)).min(1, 'ids cannot be empty'),
+  // l and tl from query (middleware may have consumed body)
+  const LangSchema = z.object({
     l: z.string().trim().optional(),
     tl: z.string().trim().optional(),
+  }).superRefine((val, ctx) => {
+    const langPattern = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/;
+    if (val.tl) {
+      if (!val.l) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l'], message: 'Language is required when translateLanguage is provided' });
+      }
+    }
+    if (val.l && !langPattern.test(val.l)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l'], message: 'Invalid language' });
+    }
+    if (val.tl && !langPattern.test(val.tl)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['tl'], message: 'Invalid translate language' });
+    }
   });
-  const parsed = BodySchema.safeParse(await c.req.json().catch(() => ({})));
-  if (!parsed.success) {
-    const first = parsed.error.issues[0];
-    logger.warn('Invalid body for caption batch', { issues: parsed.error.issues, requestId });
+  const parsedLang = LangSchema.safeParse({ l: c.req.query('l'), tl: c.req.query('tl') });
+  if (!parsedLang.success) {
+    const first = parsedLang.error.issues[0];
+    logger.warn('Invalid language for caption batch', { issues: parsedLang.error.issues, requestId });
     return c.json({ error: first?.message || 'Bad Request', code: ERROR_CODES.BAD_REQUEST }, 400);
   }
-  const { ids, l, tl } = parsed.data;
+  const l = parsedLang.data.l ?? undefined;
+  const tl = parsedLang.data.tl ?? undefined;
+
+  // Prefer ids from middleware; else parse body ids only
+  const ctxIds = c.get('batchIds') as string[] | undefined;
+  let ids: string[];
+  if (Array.isArray(ctxIds) && ctxIds.length > 0) {
+    ids = ctxIds;
+  } else {
+    const BodySchema = z.object({ ids: z.array(z.string().trim().min(1)).min(1, 'ids cannot be empty') });
+    const parsedBody = BodySchema.safeParse(await c.req.json().catch(() => ({})));
+    if (!parsedBody.success) {
+      const first = parsedBody.error.issues[0];
+      logger.warn('Invalid body for caption batch', { issues: parsedBody.error.issues, requestId });
+      return c.json({ error: first?.message || 'Bad Request', code: ERROR_CODES.BAD_REQUEST }, 400);
+    }
+    ids = parsedBody.data.ids;
+  }
 
   // Ensure player is initialized once before batch to avoid concurrent downloads per video
   try {
@@ -391,14 +369,41 @@ v1InnertubeCaptionRouter.post('/batch', async (c: Context<AppSchema>) => {
   }
 
   const throttle = readBatchThrottle(c);
-  const results = await throttleMap(ids, async (id) => {
-    return await batchFetchOne(c, id, l ?? undefined, tl ?? undefined);
+  const out: Record<string, any> = {};
+  const urlById = c.get('batchUrlById') as Map<string, string | null> | undefined;
+  const endpointMap = c.get('navigationEndpointMap') as Map<string, any> | undefined;
+
+  await throttleMap(ids, async (id) => {
+    // If middleware provided URL and endpoint, use it to resolve videoId
+    let videoId: string | undefined;
+    const url = urlById?.get(id) ?? null;
+    if (url !== null && endpointMap) {
+      if (!url) {
+        out[id] = { error: 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed', code: ERROR_CODES.BAD_REQUEST };
+        return;
+      }
+      const ep = endpointMap.get(url);
+      if (!ep) {
+        out[id] = { error: 'Video ID not found', code: ERROR_CODES.BAD_REQUEST };
+        return;
+      }
+      if ((ep as any)?.__error) {
+        out[id] = { error: (ep as any).message, code: (ep as any).code };
+        return;
+      }
+      videoId = (ep as any)?.payload?.videoId as string | undefined;
+      if (!videoId) {
+        out[id] = { error: 'Video ID not found', code: ERROR_CODES.BAD_REQUEST };
+        return;
+      }
+    } else {
+      // Fallback: treat input id as a videoId
+      videoId = id;
+    }
+
+    const r = await fetchOne(c, videoId, l ?? undefined, tl ?? undefined, { swrOnStale: false });
+    out[id] = (r as any)?.__error ? { error: (r as any).error, code: (r as any).code, __status: (r as any).__status } : (r as any)?.data ?? null;
   }, throttle);
 
-  const out: Record<string, any> = {};
-  ids.forEach((id, i) => {
-    const r = results[i];
-    out[id] = r?.__error ? { error: r.error, code: r.code, __status: r.__status } : r?.data ?? null;
-  });
   return c.json(out);
 });

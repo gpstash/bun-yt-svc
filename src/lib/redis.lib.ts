@@ -17,20 +17,7 @@ function createClient(): Redis | undefined {
     logger.warn('REDIS_URL not set. Redis cache disabled.');
     return undefined;
   }
-  const redis = new Redis(REDIS_URL, {
-    lazyConnect: true,
-    maxRetriesPerRequest: 3,
-    enableOfflineQueue: true,
-    connectTimeout: 10000,
-    lazyConnectTimeout: 10000,
-    keepAlive: 30000,
-    family: 0, // Allow both IPv4 and IPv6
-    dns: {
-      lookup: require('dns').lookup,
-    },
-    retryDelayOnFailover: 100,
-    retryDelayOnClusterDown: 300,
-  });
+  const redis = new Redis(REDIS_URL);
   // Build a safe URL for logs (mask password)
   const safeUrl = (() => {
     try {
