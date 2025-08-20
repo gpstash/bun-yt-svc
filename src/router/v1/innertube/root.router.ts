@@ -7,6 +7,7 @@ import { v1InnertubeTranscriptRouter } from './transcript.router';
 import { v1InnertubeUtilsRouter } from './utils.router';
 import { innertubeMiddleware } from '@/middleware/innertube.middleware';
 import { navigationMiddleware } from '@/middleware/navigation.middleware';
+import { v1InnertubeChannelRouter } from './channel.router';
 
 export const v1InnertubeRootRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube');
@@ -26,3 +27,6 @@ v1InnertubeRootRouter.route('/caption', v1InnertubeCaptionRouter);
 
 logger.debug('Mount /transcript router');
 v1InnertubeRootRouter.route('/transcript', v1InnertubeTranscriptRouter);
+
+logger.debug('Mount /channel router');
+v1InnertubeRootRouter.route('/channel', v1InnertubeChannelRouter);

@@ -62,8 +62,10 @@ function detectYouTubeError(err: unknown): { status: number; code: ErrorCode; me
   if (!err) return undefined;
   const name = (err as any)?.name as string | undefined;
   const message = String((err as any)?.message || '');
+  const info = (err as any)?.info as unknown;
+  const infoText = typeof info === 'string' ? info : JSON.stringify(info ?? '');
 
-  const text = `${name || ''} ${message}`.toLowerCase();
+  const text = `${name || ''} ${message} ${infoText}`.toLowerCase();
   // Heuristics based on common Innertube/YouTube error messages and playability reasons
   // These strings may come from playability_status.reason or InnertubeError messages
   const has = (s: string) => text.includes(s.toLowerCase());
@@ -103,6 +105,11 @@ function detectYouTubeError(err: unknown): { status: number; code: ErrorCode; me
   // General unavailability
   if (has('video unavailable') || has('this video is unavailable') || has('unplayable') || has('unavailable')) {
     return { status: 404, code: ERROR_CODES.YT_UNAVAILABLE, message: 'Video unavailable' };
+  }
+
+  // Resolve URL / generic upstream 404 phrasing seen from youtubei navigation
+  if (has('requested entity was not found')) {
+    return { status: 404, code: ERROR_CODES.UPSTREAM_NOT_FOUND, message: 'Resource not found upstream' };
   }
 
   // Transcript unavailable / disabled / not found
