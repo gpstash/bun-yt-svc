@@ -81,3 +81,17 @@ export function readBatchThrottle(
 
   return { concurrency, minDelayMs, maxDelayMs };
 }
+
+/**
+ * Remove duplicates while preserving the first occurrence order.
+ */
+export function dedupeOrdered<T>(items: readonly T[]): T[] {
+  const seen = new Set<T>();
+  const out: T[] = [];
+  for (const it of items) {
+    if (seen.has(it)) continue;
+    seen.add(it);
+    out.push(it);
+  }
+  return out;
+}

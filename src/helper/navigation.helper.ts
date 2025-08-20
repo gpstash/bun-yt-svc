@@ -1,3 +1,6 @@
+import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
+import { jitterTtl } from '@/lib/cache.util';
+
 export function isValidYoutubeChannelUrl(url: string): boolean {
   try {
     const u = new URL(url);
@@ -84,6 +87,29 @@ export function buildChannelUrlFromHandle(input: string): string | null {
   return `https://www.youtube.com/${h}`;
 }
 
+// Shared function: build a canonical YouTube URL from an arbitrary id or URL
+// - Accepts direct YouTube channel/video URLs, channelId (UC...), videoId, or handle
+// - Returns canonical URL string or null if unsupported
+export function buildYoutubeUrlFromId(id: string): string | null {
+  if (!id || typeof id !== 'string') return null;
+  const trimmed = id.trim();
+  if (!trimmed) return null;
+
+  if (isValidYoutubeChannelUrl(trimmed) || isValidYoutubeWatchUrl(trimmed)) {
+    return trimmed;
+  }
+  if (isValidChannelId(trimmed)) {
+    return buildChannelUrlFromId(trimmed) ?? null;
+  }
+  if (isValidVideoId(trimmed)) {
+    return buildWatchUrlFromVideoId(trimmed) ?? null;
+  }
+  if (isValidHandle(trimmed)) {
+    return buildChannelUrlFromHandle(trimmed) ?? null;
+  }
+  return null;
+}
+
 function isHttpProtocol(protocol: string): boolean {
   return protocol === 'http:' || protocol === 'https:';
 }
@@ -104,6 +130,21 @@ function isChannelIdPath(pathname: string): boolean {
   // Channel ID format: /channel/UC[22 chars of [0-9A-Za-z_-]]
   const re = new RegExp(`^/channel/UC[0-9A-Za-z_-]{22}${tabSegment}`);
   return re.test(pathname);
+}
+
+export async function resolveNavigationWithCache(innertube: { resolveURL: (url: string) => Promise<any> }, url: string, config: { VIDEO_CACHE_TTL_SECONDS: number; CHANNEL_CACHE_TTL_SECONDS: number; }): Promise<any> {
+  const isWatch = isValidYoutubeWatchUrl(url);
+  const videoTtl = config.VIDEO_CACHE_TTL_SECONDS;
+  const channelTtl = config.CHANNEL_CACHE_TTL_SECONDS;
+  const ttl = isWatch ? videoTtl : channelTtl;
+  const cacheKey = `yt:navigation:${isWatch ? 'watch' : 'channel'}:${url}`;
+
+  const cached = await redisGetJson<any>(cacheKey).catch(() => null);
+  if (cached) return cached;
+
+  const navigationEndpoint = await innertube.resolveURL(url);
+  try { await redisSetJson(cacheKey, navigationEndpoint, jitterTtl(ttl)); } catch { /* noop */ }
+  return navigationEndpoint;
 }
 
 function isHandlePath(pathname: string): boolean {

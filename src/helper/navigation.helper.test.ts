@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, mock } from 'bun:test';
 import {
   isValidYoutubeChannelUrl,
   isValidYoutubeWatchUrl,
@@ -8,6 +8,7 @@ import {
   buildChannelUrlFromId,
   buildWatchUrlFromVideoId,
   buildChannelUrlFromHandle,
+  buildYoutubeUrlFromId,
 } from './navigation.helper';
 
 // Helper to generate unique test names
@@ -210,4 +211,94 @@ describe('isValidVideoId', () => {
       expect(isValidVideoId(v)).toBe(false);
     }),
   );
+});
+
+describe('buildYoutubeUrlFromId (shared)', () => {
+  test('returns same string when id is already a valid channel/watch URL', () => {
+    const ch = 'https://www.youtube.com/@handle123';
+    const w = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+    expect(buildYoutubeUrlFromId(ch)).toBe(ch);
+    expect(buildYoutubeUrlFromId(w)).toBe(w);
+  });
+
+  test('builds channel URL from channelId', () => {
+    const uc = 'UCabcdefghijklmno_p-1Qzz';
+    expect(buildYoutubeUrlFromId(uc)).toBe(`https://www.youtube.com/channel/${uc}`);
+    expect(buildYoutubeUrlFromId(`/channel/${uc}/`)).toBe(`https://www.youtube.com/channel/${uc}`);
+  });
+
+  test('builds watch URL from videoId', () => {
+    expect(buildYoutubeUrlFromId('dQw4w9WgXcQ')).toBe('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+    expect(buildYoutubeUrlFromId(' dQw4w9WgXcQ ')).toBe('https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+  });
+
+  test('builds channel URL from handle', () => {
+    expect(buildYoutubeUrlFromId('@handle123')).toBe('https://www.youtube.com/@handle123');
+    expect(buildYoutubeUrlFromId('handle123')).toBe('https://www.youtube.com/@handle123');
+    expect(buildYoutubeUrlFromId('/@handle123')).toBe('https://www.youtube.com/@handle123');
+  });
+
+  test('returns null for unsupported/invalid id', () => {
+    expect(buildYoutubeUrlFromId('')).toBeNull();
+    expect(buildYoutubeUrlFromId('   ')).toBeNull();
+    expect(buildYoutubeUrlFromId('not a url and not valid id')).toBeNull();
+  });
+});
+
+describe('resolveNavigationWithCache', () => {
+  test('returns cached on hit; resolves and caches on miss with correct key/ttl', async () => {
+    // Arrange mocks
+    const calls: any[] = [];
+    let cache: Record<string, any> = {};
+
+    mock.module('@/lib/cache.util', () => ({
+      jitterTtl: (ttl: number) => ttl, // identity for test predictability
+    }));
+
+    mock.module('@/lib/redis.lib', () => ({
+      redisGetJson: async (key: string) => {
+        calls.push({ fn: 'get', key });
+        return cache[key] ?? null;
+      },
+      redisSetJson: async (key: string, val: any, ttl: number) => {
+        calls.push({ fn: 'set', key, ttl });
+        cache[key] = val;
+      },
+    }));
+
+    // Dynamically import after mocks are set
+    const { resolveNavigationWithCache } = await import('./navigation.helper');
+
+    // Miss path (watch URL)
+    const urlWatch = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+    const innertube = { resolveURL: async (_u: string) => ({ type: 'watch', v: 'dQw4w9WgXcQ' }) };
+    const config = { VIDEO_CACHE_TTL_SECONDS: 300, CHANNEL_CACHE_TTL_SECONDS: 600 };
+    const resWatch1 = await resolveNavigationWithCache(innertube, urlWatch, config);
+    expect(resWatch1).toEqual({ type: 'watch', v: 'dQw4w9WgXcQ' });
+    expect(cache[`yt:navigation:watch:${urlWatch}`]).toEqual(resWatch1);
+
+    // Hit path (watch URL)
+    const resWatch2 = await resolveNavigationWithCache(innertube, urlWatch, config);
+    expect(resWatch2).toEqual(resWatch1);
+
+    // Miss path (channel URL)
+    const urlChannel = 'https://www.youtube.com/@handle123';
+    const resChannel1 = await resolveNavigationWithCache(
+      { resolveURL: async (_u: string) => ({ type: 'channel', h: '@handle123' }) },
+      urlChannel,
+      config,
+    );
+    expect(resChannel1).toEqual({ type: 'channel', h: '@handle123' });
+    expect(cache[`yt:navigation:channel:${urlChannel}`]).toEqual(resChannel1);
+
+    // Hit path (channel URL)
+    const resChannel2 = await resolveNavigationWithCache(innertube, urlChannel, config);
+    expect(resChannel2).toEqual(resChannel1);
+
+    // Validate calls order includes get/set interactions
+    expect(calls.some(c => c.fn === 'get' && c.key === `yt:navigation:watch:${urlWatch}`)).toBe(true);
+    expect(calls.some(c => c.fn === 'set' && c.key === `yt:navigation:watch:${urlWatch}` && c.ttl === 300)).toBe(true);
+    expect(calls.some(c => c.fn === 'get' && c.key === `yt:navigation:channel:${urlChannel}`)).toBe(true);
+    expect(calls.some(c => c.fn === 'set' && c.key === `yt:navigation:channel:${urlChannel}` && c.ttl === 600)).toBe(true);
+  });
 });

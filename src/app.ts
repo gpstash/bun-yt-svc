@@ -6,6 +6,7 @@ import { v1RootRouter } from '@/router/v1/root.router';
 import type { InnertubeService } from '@/service/innertube.service';
 import type { Context } from 'hono';
 import type { YTNodes } from 'youtubei.js';
+import type { NavigationMapValue } from '@/types/navigation.types';
 
 export interface AppVariables {
   config: AppConfig;
@@ -13,6 +14,8 @@ export interface AppVariables {
   signal: AbortSignal;
   requestId: string;
   navigationEndpoint?: YTNodes.NavigationEndpoint;
+  batchIds?: string[];
+  navigationEndpointMap?: Map<string, NavigationMapValue>;
 }
 
 export interface AppSchema {
