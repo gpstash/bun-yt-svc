@@ -47,80 +47,171 @@ Environment variables are validated by `src/config.ts`.
 Proxy is only used for the Innertube player endpoint when `PROXY_STATUS=active`.
 
 
+## Database
+
+This project includes an optional PostgreSQL persistence layer via Drizzle ORM to cache normalized video, transcript, caption, and channel payloads.
+
+- Drizzle config: `drizzle.config.ts` (schema: `src/db/schema.ts`, migrations out: `db/migrations/`)
+- Schema tables (PostgreSQL schema `yt-svc`):
+  - `videos` — normalized video info and metadata.
+  - `transcripts` — transcript segments per `(videoId, language)` with unique index.
+  - `captions` — caption segments/words per `(videoId, language, targetLanguage)` with unique index.
+  - `channels` — normalized channel info.
+
+Environment:
+
+- `DATABASE_URL` — Postgres connection string (if unset, DB client stays uninitialized; API still works with Redis caching).
+
+Migrations:
+
+```sh
+# Generate from schema (optional if only using provided SQL migrations)
+bun run drizzle:generate
+
+# Apply migrations to DATABASE_URL
+bun run drizzle:migrate
+```
+
+
+## Caching & Redis
+
+High-throughput responses are cached in Redis with SWR (stale-while-revalidate) patterns and short-lived negative caches for certain client errors.
+
+- `REDIS_URL` (default: `redis://localhost:6379`)
+- TTLs (validated in `src/config.ts`):
+  - `VIDEO_CACHE_TTL_SECONDS` (default 14400)
+  - `CHANNEL_CACHE_TTL_SECONDS` (default 86400)
+  - `TRANSCRIPT_CACHE_TTL_SECONDS` (default 86400)
+  - `CAPTION_CACHE_TTL_SECONDS` (default 86400)
+- Batch throttling envs:
+  - `INNERTUBE_BATCH_CONCURRENCY` (default 3, max 10)
+  - `INNERTUBE_BATCH_MIN_DELAY_MS` (default 150)
+  - `INNERTUBE_BATCH_MAX_DELAY_MS` (default 400)
+
+Cache keys (examples):
+
+- Video: `yt:video:${videoId}`
+- Transcript: `yt:transcript:${videoId}:${language|'default'}` (+ alias key)
+- Caption: `yt:caption:${videoId}:${language|'default'}[:${translateLanguage}]` (+ alias key)
+- Channel: `yt:channel:${channelId}`
+
+Negative caching is applied only for specific 4xx cases (e.g., language validation or bad request) to reduce repeat load.
+
+
 ## API
 
 Base path: `/v1/innertube`
 
 All endpoints support request aborts (client cancel -> 499).
 
-### GET /v1/innertube/video
+ID resolution is centralized via `navigationMiddleware()` and `navigationBatchMiddleware()`. Provide `id=` which can be any of:
 
-Query:
+- YouTube video URL, video ID
+- YouTube channel URL, channel ID, or handle (e.g., `@handle`)
 
-- `v` — required YouTube video ID
+### GET /v1/innertube/video?id=...
 
-Response: normalized `ParsedVideoInfo` shape
+Params:
 
-```jsonc
-{
-  "id": "...",
-  "title": "...",
-  "description": "...",
-  "thumbnails": [{ "url": "...", "width": 120, "height": 90 }, ...],
-  "category": "...",
-  "tags": ["..."],
-  "duration": 123,
-  "channel": { "id": "...", "name": "...", "url": "..." },
-  "viewCount": 0,
-  "likeCount": 0,
-  "publishDate": { "raw": "...", "formatted": "ISO8601 or empty" },
-  "transcriptLanguages": ["English", "..."],
-  "hasTranscripts": true,
-  "captionLanguages": [
-    { "name": "English", "languageCode": "en", "rtl": false, "isTranslatable": true }
-  ],
-  "hasCaptions": true
-}
-```
+- `id` — required (video URL or videoId)
+
+Returns normalized video info.
 
 Example:
 
 ```sh
-curl "http://localhost:1331/v1/innertube/video?v=dQw4w9WgXcQ"
+curl "http://localhost:1331/v1/innertube/video?id=dQw4w9WgXcQ"
+curl "http://localhost:1331/v1/innertube/video?id=https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 ```
 
-### GET /v1/innertube/transcript
+Batch (POST): `/v1/innertube/video/batch`
 
-Query:
-
-- `v` — required YouTube video ID
-- `l` — optional preferred language code (e.g., `en`, `id`)
-
-Response: normalized `ParsedTranscript` shape
-
-```jsonc
-{
-  "language": "en",
-  "transcriptLanguages": ["en", "id", "..."],
-  "hasTranscript": true,
-  "segments": [
-    { "text": "Hello world", "start": 0, "end": 1200 },
-    { "text": "...", "start": 1200, "end": 2400 }
-  ],
-  "text": "Hello world ..."
-}
-```
-
-Example:
+- Body: `{ "ids": ["<videoId|url>", ...] }`
+- Returns object keyed by input id.
 
 ```sh
-curl "http://localhost:1331/v1/innertube/transcript?v=dQw4w9WgXcQ&l=en"
+curl -X POST "http://localhost:1331/v1/innertube/video/batch" \
+  -H 'content-type: application/json' \
+  -d '{ "ids": ["dQw4w9WgXcQ", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"] }'
 ```
+
+### GET /v1/innertube/transcript?id=...&l=...
+
+Params:
+
+- `id` — required (video URL or videoId)
+- `l` — optional language code (e.g., `en`, `id`)
 
 Notes:
 
 - If a video has no captions/tracks, the service returns `hasTranscript: false` and empty arrays/strings.
-- If transcript fetching fails (network/Innertube/playability), the endpoint returns an error with a precise code (see Error codes).
+- Language resolution uses requested language when available; else falls back to preferred language (e.g., English) or an alias derived from prior successful fetches.
+
+Example:
+
+```sh
+curl "http://localhost:1331/v1/innertube/transcript?id=dQw4w9WgXcQ&l=en"
+```
+
+Batch (POST): `/v1/innertube/transcript/batch?l=en`
+
+- Body: `{ "ids": ["<videoId|url>", ...] }`
+- Query: `l` optional
+
+```sh
+curl -X POST "http://localhost:1331/v1/innertube/transcript/batch?l=en" \
+  -H 'content-type: application/json' \
+  -d '{ "ids": ["dQw4w9WgXcQ", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"] }'
+```
+
+### GET /v1/innertube/caption?id=...&l=...&tl=...
+
+Params:
+
+- `id` — required (video URL or videoId)
+- `l` — optional source caption language
+- `tl` — optional translate-to language (requires `l`)
+
+Validation follows BCP-47-like pattern. If invalid language codes are supplied, a 400 is returned and a short negative cache may be set.
+
+Example:
+
+```sh
+curl "http://localhost:1331/v1/innertube/caption?id=dQw4w9WgXcQ&l=en"
+curl "http://localhost:1331/v1/innertube/caption?id=dQw4w9WgXcQ&l=en&tl=id"
+```
+
+Batch (POST): `/v1/innertube/caption/batch?l=en[&tl=id]`
+
+- Body: `{ "ids": ["<videoId|url>", ...] }`
+
+```sh
+curl -X POST "http://localhost:1331/v1/innertube/caption/batch?l=en&tl=id" \
+  -H 'content-type: application/json' \
+  -d '{ "ids": ["dQw4w9WgXcQ", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"] }'
+```
+
+### GET /v1/innertube/channel?id=...
+
+Params:
+
+- `id` — required (channel URL, channelId, or @handle)
+
+Example:
+
+```sh
+curl "http://localhost:1331/v1/innertube/channel?id=@YouTube"
+```
+
+Batch (POST): `/v1/innertube/channel/batch`
+
+- Body: `{ "ids": ["<channelId|url|@handle>", ...] }`
+
+```sh
+curl -X POST "http://localhost:1331/v1/innertube/channel/batch" \
+  -H 'content-type: application/json' \
+  -d '{ "ids": ["UC_x5XG1OV2P6uZZ5FSM9Ttw", "https://www.youtube.com/@YouTube"] }'
+```
 
 
 ## Logging
@@ -181,6 +272,7 @@ Cold start tips:
 
 - The build step emits a single JS bundle (`dist/index.js`) and runtime image starts that directly.
 - Heavy modules like `jsdom` are lazily imported only when needed (`pot.lib.ts`).
+- `src/index.ts` pre-warms the Innertube player (`InnertubeService.ensurePlayerReady()`) to reduce first-hit latency.
 
 Deploy (typical):
 
