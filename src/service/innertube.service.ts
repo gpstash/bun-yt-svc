@@ -4,6 +4,7 @@ import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedVi
 import { decodeJson3Caption, buildParsedVideoInfoWithCaption } from "@/helper/caption.helper";
 import { http, HttpOptions } from "@/lib/http.lib";
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { parseChannelInfo, type ParsedChannelInfo } from "@/helper/channel.helper";
 
 const logger = createLogger('service:InnertubeService');
 
@@ -236,6 +237,16 @@ export class InnertubeService {
     const ctx2 = InnertubeService.requestContext.getStore();
     logger.info('getTranscript:done', { id, language, durationMs, requestId: ctx2?.requestId, hasTranscript: parsed.transcript.segments.length > 0 });
     return parsed;
+  }
+
+  public async getChannel(id: string): Promise<ParsedChannelInfo> {
+    const ctx = InnertubeService.requestContext.getStore();
+    logger.debug('getChannel:start', { id, requestId: ctx?.requestId });
+    const channel = await this.innertube.getChannel(id);
+    logger.debug('getChannel:fetched', { id, requestId: ctx?.requestId });
+
+    const parsedChannelInfo = await parseChannelInfo(channel);
+    return parsedChannelInfo;
   }
 
   // Centralized raw getInfo with 3 attempts when playability appears unavailable (no Po token)

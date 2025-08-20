@@ -59,3 +59,26 @@ export const captions = ytSvc.table('captions', {
   };
 });
 
+
+// Channels table to persist parsed channel info
+export const channels = ytSvc.table('channels', {
+  id: text('id').primaryKey(),
+  title: text('title').notNull(),
+  description: text('description').notNull(),
+  url: text('url').notNull(),
+  vanityUrl: text('vanity_url').notNull(),
+  isFamilySafe: boolean('is_family_safe').notNull(),
+  keywords: jsonb('keywords').$type<string[]>().notNull(),
+  avatar: jsonb('avatar').$type<Array<{ url: string; width: number; height: number }> | { url: string; width: number; height: number }>().notNull(),
+  thumbnail: jsonb('thumbnail').$type<Array<{ url: string; width: number; height: number }> | { url: string; width: number; height: number }>().notNull(),
+  tags: jsonb('tags').$type<string[]>().notNull(),
+  isUnlisted: boolean('is_unlisted').notNull(),
+  subscriberCount: text('subscriber_count').notNull(),
+  viewCount: text('view_count').notNull(),
+  joinedDate: text('joined_date').notNull(),
+  videoCount: text('video_count').notNull(),
+  country: text('country').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
+

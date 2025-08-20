@@ -14,6 +14,8 @@ import {
   buildWatchUrlFromVideoId,
   buildChannelUrlFromHandle,
 } from "@/helper/navigation.helper";
+import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
+import { jitterTtl } from '@/lib/cache.util';
 
 const logger = createLogger('middleware:navigation');
 
@@ -56,10 +58,27 @@ export function navigationMiddleware(): MiddlewareHandler<AppSchema> {
       }
 
       try {
+        const isWatch = isValidYoutubeWatchUrl(url);
+        const ttl = isWatch ? c.get('config').VIDEO_CACHE_TTL_SECONDS : c.get('config').CHANNEL_CACHE_TTL_SECONDS;
+        const cacheKey = `yt:navigation:${isWatch ? 'watch' : 'channel'}:${url}`;
+
+        // 1) cache first
+        const cached = await redisGetJson<{ payload: any }>(cacheKey).catch(() => null);
+        if (cached && cached.payload) {
+          logger.debug('Navigation cache hit', { url, requestId });
+          c.set('navigationEndpoint', { payload: cached.payload } as any);
+          return await next();
+        }
+
+        // 2) resolve upstream, store only payload to keep it JSON-serializable
         logger.debug('Resolve URL', { url, requestId });
         const navigationEndpoint = await innertubeSvc.getInnertube().resolveURL(url);
-        logger.debug('Resolved URL', { navigationEndpoint, requestId });
-        c.set('navigationEndpoint', navigationEndpoint);
+        const payload = (navigationEndpoint as any)?.payload ?? null;
+        logger.debug('Resolved URL', { requestId });
+        if (payload) {
+          try { await redisSetJson(cacheKey, { payload }, jitterTtl(ttl)); } catch { /* noop */ }
+        }
+        c.set('navigationEndpoint', payload ? ({ payload } as any) : navigationEndpoint);
       } catch (err) {
         const mapped = mapErrorToHttp(err);
         logger.error('Error resolving navigation URL', { err, mapped, requestId });

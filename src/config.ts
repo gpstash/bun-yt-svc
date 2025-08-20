@@ -10,6 +10,7 @@ export const configSchema = z.object({
   PROXY_STATUS: z.enum(['active', 'inactive']).default('inactive'),
   REDIS_URL: z.string().default('redis://localhost:6379'),
   VIDEO_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 4), // 4 hours
+  CHANNEL_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24), // 1 day
   TRANSCRIPT_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24), // 1 day
   CAPTION_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24), // 1 day
   // Batch throttling controls for safe crawling
