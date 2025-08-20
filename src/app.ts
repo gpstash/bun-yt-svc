@@ -16,6 +16,7 @@ export interface AppVariables {
   navigationEndpoint?: YTNodes.NavigationEndpoint;
   batchIds?: string[];
   navigationEndpointMap?: Map<string, NavigationMapValue>;
+  batchUrlById?: Map<string, string | null>;
 }
 
 export interface AppSchema {

@@ -95,8 +95,13 @@ export function buildYoutubeUrlFromId(id: string): string | null {
   const trimmed = id.trim();
   if (!trimmed) return null;
 
-  if (isValidYoutubeChannelUrl(trimmed) || isValidYoutubeWatchUrl(trimmed)) {
+  // Normalize known YouTube URLs
+  if (isValidYoutubeChannelUrl(trimmed)) {
     return trimmed;
+  }
+  if (isValidYoutubeWatchUrl(trimmed)) {
+    const vid = extractVideoIdFromUrl(trimmed);
+    return vid ? buildWatchUrlFromVideoId(vid) : trimmed;
   }
   if (isValidChannelId(trimmed)) {
     return buildChannelUrlFromId(trimmed) ?? null;
@@ -108,6 +113,41 @@ export function buildYoutubeUrlFromId(id: string): string | null {
     return buildChannelUrlFromHandle(trimmed) ?? null;
   }
   return null;
+}
+
+// Extract a YouTube video ID from various valid watch-like URLs
+function extractVideoIdFromUrl(url: string): string | null {
+  try {
+    const u = new URL(url);
+    // Standard watch URL: /watch?v=ID
+    if (hasWatchWithVideoId(u)) {
+      const v = u.searchParams.get('v');
+      return v && /^[0-9A-Za-z_-]{11}$/.test(v) ? v : null;
+    }
+    // Shorts: /shorts/ID
+    if (isShortsPath(u.pathname)) {
+      const match = u.pathname.match(/[0-9A-Za-z_-]{11}/);
+      return match ? match[0] : null;
+    }
+    // Embed: /embed/ID
+    if (isEmbedPath(u.pathname)) {
+      const match = u.pathname.match(/[0-9A-Za-z_-]{11}/);
+      return match ? match[0] : null;
+    }
+    // Live: /live/ID
+    if (isLivePath(u.pathname)) {
+      const match = u.pathname.match(/[0-9A-Za-z_-]{11}/);
+      return match ? match[0] : null;
+    }
+    // youtu.be/ID
+    if (isYoutuBePath(u.hostname, u.pathname)) {
+      const match = u.pathname.match(/[0-9A-Za-z_-]{11}/);
+      return match ? match[0] : null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function isHttpProtocol(protocol: string): boolean {

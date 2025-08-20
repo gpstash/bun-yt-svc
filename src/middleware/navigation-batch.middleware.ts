@@ -38,7 +38,18 @@ export function navigationBatchMiddleware(): MiddlewareHandler<AppSchema> {
       const uniqueIds = dedupeOrdered(ids);
       c.set('batchIds', uniqueIds);
 
-      const urls = uniqueIds.map(buildYoutubeUrlFromId).filter((url): url is string => !!url);
+      // Map each input id to its canonical URL (or null if unsupported)
+      const urlById = new Map<string, string | null>();
+      for (const id of uniqueIds) {
+        const url = buildYoutubeUrlFromId(id) ?? null;
+        urlById.set(id, url);
+      }
+      c.set('batchUrlById', urlById);
+
+      // Build unique list of resolvable URLs only
+      const urls = uniqueIds
+        .map((id) => urlById.get(id))
+        .filter((url): url is string => typeof url === 'string' && url.length > 0);
       const uniqueUrls: string[] = dedupeOrdered(urls);
 
       if (uniqueUrls.length === 0) {

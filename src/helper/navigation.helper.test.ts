@@ -238,6 +238,26 @@ describe('buildYoutubeUrlFromId (shared)', () => {
     expect(buildYoutubeUrlFromId('/@handle123')).toBe('https://www.youtube.com/@handle123');
   });
 
+  test('normalizes youtu.be short link to canonical watch URL', () => {
+    const short = 'https://youtu.be/ZGx1_z_l8M8';
+    expect(buildYoutubeUrlFromId(short)).toBe('https://www.youtube.com/watch?v=ZGx1_z_l8M8');
+  });
+
+  test('normalizes shorts URL to canonical watch URL', () => {
+    const shorts = 'https://www.youtube.com/shorts/ZGx1_z_l8M8';
+    expect(buildYoutubeUrlFromId(shorts)).toBe('https://www.youtube.com/watch?v=ZGx1_z_l8M8');
+  });
+
+  test('normalizes embed URL to canonical watch URL', () => {
+    const embed = 'https://www.youtube.com/embed/ZGx1_z_l8M8';
+    expect(buildYoutubeUrlFromId(embed)).toBe('https://www.youtube.com/watch?v=ZGx1_z_l8M8');
+  });
+
+  test('normalizes live URL to canonical watch URL', () => {
+    const live = 'https://www.youtube.com/live/ZGx1_z_l8M8';
+    expect(buildYoutubeUrlFromId(live)).toBe('https://www.youtube.com/watch?v=ZGx1_z_l8M8');
+  });
+
   test('returns null for unsupported/invalid id', () => {
     expect(buildYoutubeUrlFromId('')).toBeNull();
     expect(buildYoutubeUrlFromId('   ')).toBeNull();

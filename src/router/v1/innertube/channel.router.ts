@@ -10,8 +10,9 @@ import { upsertChannel, getChannelById } from '@/service/channel.service';
 import { z } from 'zod';
 import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
 import { buildYoutubeUrlFromId, resolveNavigationWithCache } from '@/helper/navigation.helper';
-import { navigationBatchMiddleware } from "@/middleware/navigation-batch.middleware";
 import type { NavigationMapValue, ChannelBatchResponse } from '@/types/navigation.types';
+import { navigationBatchMiddleware } from "@/middleware/navigation-batch.middleware";
+import { navigationMiddleware } from "@/middleware/navigation.middleware";
 
 export const v1InnertubeChannelRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:channel');
@@ -109,43 +110,7 @@ async function batchFetchOne(c: Context<AppSchema>, channelId: string) {
   return fetchChannel(c, channelId, { serveStale: false });
 }
 
-async function resolveChannelIdFromInput(
-  c: Context<AppSchema>,
-  id: string,
-): Promise<{ channelId: string | null; error?: { message: string; code: ErrorCode } }> {
-  const endpointMap = c.get('navigationEndpointMap') as Map<string, NavigationMapValue> | undefined;
-
-  const url = buildYoutubeUrlFromId(id);
-  if (!url) {
-    return { channelId: null, error: { message: 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed', code: ERROR_CODES.BAD_REQUEST } };
-  }
-
-  // Prefer URL -> endpoint map if available (works with deduped URLs)
-  if (endpointMap && endpointMap.size > 0) {
-    const ep = endpointMap.get(url);
-    if (ep) {
-      if ((ep as any)?.__error) {
-        return { channelId: null, error: { message: (ep as any).message, code: (ep as any).code } };
-      }
-      return { channelId: (ep as any)?.payload?.browseId ?? null };
-    }
-  }
-
-  try {
-    const navigation = await resolveNavigationWithCache(
-      c.get('innertubeSvc').getInnertube(),
-      url,
-      c.get('config') as any,
-    );
-    const channelId = (navigation as any)?.payload?.browseId ?? null;
-    return { channelId };
-  } catch (e) {
-    const mapped = mapErrorToHttp(e);
-    return { channelId: null, error: { message: mapped.message || 'Failed to resolve URL', code: mapped.code } };
-  }
-}
-
-v1InnertubeChannelRouter.get('/', async (c: Context<AppSchema>) => {
+v1InnertubeChannelRouter.get('/', navigationMiddleware(), async (c: Context<AppSchema>) => {
   try {
     const navigationEndpoint = c.get('navigationEndpoint');
     const channelId = navigationEndpoint?.payload?.browseId;
@@ -212,11 +177,24 @@ v1InnertubeChannelRouter.post('/batch', navigationBatchMiddleware(), async (c: C
     await throttleMap(
       ids,
       async (id) => {
-        const { channelId, error } = await resolveChannelIdFromInput(c, id);
-        if (error) {
-          results[id] = { error: error.message, code: error.code };
+        const urlById = c.get('batchUrlById') as Map<string, string | null> | undefined;
+        const endpointMap = c.get('navigationEndpointMap') as Map<string, any> | undefined;
+
+        const url = urlById?.get(id) ?? null;
+        if (!url) {
+          results[id] = { error: 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed', code: ERROR_CODES.BAD_REQUEST };
           return;
         }
+        const ep = endpointMap?.get(url);
+        if (!ep) {
+          results[id] = { error: 'Channel ID not found', code: ERROR_CODES.BAD_REQUEST };
+          return;
+        }
+        if ((ep as any)?.__error) {
+          results[id] = { error: (ep as any).message, code: (ep as any).code };
+          return;
+        }
+        const channelId = (ep as any)?.payload?.browseId as string | undefined;
         if (!channelId) {
           results[id] = { error: 'Channel ID not found', code: ERROR_CODES.BAD_REQUEST };
           return;
