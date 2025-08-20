@@ -10,10 +10,56 @@ import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegat
 import { getTranscriptByVideoAndLanguage, upsertTranscript, getPreferredTranscriptLanguage, hasTranscriptLanguage } from '@/service/transcript.service';
 import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
 import { getVideoById, upsertVideo } from '@/service/video.service';
+import { navigationMiddleware } from '@/middleware/navigation.middleware';
+import { navigationBatchMiddleware } from '@/middleware/navigation-batch.middleware';
 
 export const v1InnertubeTranscriptRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:transcript');
 logger.debug('Initializing /v1/innertube/transcript router');
+
+// Shared constants/utilities
+const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode>([
+  ERROR_CODES.INVALID_LANGUAGE,
+  ERROR_CODES.INVALID_TRANSLATE_LANGUAGE,
+  ERROR_CODES.YT_TRANSLATION_UNSUPPORTED,
+  ERROR_CODES.YT_TRANSLATION_SAME_LANGUAGE,
+]);
+
+function shouldNegativeCache(status: number, code: ErrorCode): boolean {
+  return status >= 400 && status < 500 && LANG_RELATED_CODES.has(code);
+}
+
+async function getCachedJson<T>(key: string): Promise<T | undefined> {
+  try {
+    const val = await redisGetJson<T>(key);
+    return (val as any) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function computeAgeSeconds(updatedAt: Date): number {
+  const now = Date.now();
+  const updatedAtMs = new Date(updatedAt).getTime();
+  return Math.max(0, Math.floor((now - updatedAtMs) / 1000));
+}
+
+async function setAliasIfNoRequested(videoId: string, requestedLang: string | undefined | null, languageToSet: string, ttlSeconds: number) {
+  if (!requestedLang) {
+    try { await setAlias(videoId, languageToSet, ttlSeconds); }
+    catch { /* noop */ }
+  }
+}
+
+async function negativeCacheIfLanguageRelated(cacheKey: string, mapped: { status: number; code: ErrorCode; message?: string }, requestId?: string, logPrefix: string = 'transcript') {
+  if (shouldNegativeCache(mapped.status, mapped.code)) {
+    const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
+    try {
+      await redisSetJson(cacheKey, neg, jitterTtl(60));
+      logger.debug(`${logPrefix} negative-cache set`, { cacheKey, status: mapped.status, code: mapped.code, requestId });
+    } catch { /* noop */ }
+  }
+}
 
 function buildCacheKey(videoId: string, language: string | undefined | null): string {
   const cacheLang = language ?? 'default';
@@ -140,8 +186,58 @@ async function fetchPersistAndCache(c: Context<AppSchema>, videoId: string, effe
   }
 }
 
-// Minimal per-id worker for batch transcripts
-async function batchFetchOne(
+// Encapsulate DB read and optional SWR refresh
+async function tryServeFromDb(
+  c: Context<AppSchema>,
+  videoId: string,
+  effectiveLang: string | undefined | null,
+  requestedLang: string | undefined | null,
+  ttlSeconds: number,
+  requestId: string | undefined,
+  cacheKey: string,
+  logContext: 'single' | 'batch' = 'single',
+): Promise<{ assembled: any | null }> {
+  try {
+    const dbRes = await getTranscriptByVideoAndLanguage(videoId, effectiveLang || '');
+    if (!dbRes) {
+      logger.debug(`${logContext === 'batch' ? 'Batch ' : ''}DB miss for transcript`, { videoId, language: effectiveLang, requestId });
+      return { assembled: null };
+    }
+
+    const ageSeconds = computeAgeSeconds(dbRes.updatedAt);
+    if (ageSeconds < ttlSeconds) {
+      const remaining = Math.max(1, ttlSeconds - ageSeconds);
+      const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, requestId);
+      logger.info(`${logContext === 'batch' ? 'Batch ' : ''}DB hit within TTL for transcript`, { videoId, language: dbRes.language, ageSeconds, remaining, requestId });
+      await setAliasIfNoRequested(videoId, requestedLang, dbRes.language, remaining);
+      return { assembled };
+    }
+
+    // Stale-while-revalidate
+    logger.info(`${logContext === 'batch' ? 'Batch ' : ''}DB hit but stale; will fetch`, { videoId, language: effectiveLang, ageSeconds, ttlSeconds, requestId });
+    const assembled = await assembleFromDbAndCache(c, videoId, dbRes, Math.max(1, Math.floor(ttlSeconds / 10)), requestId);
+    if (logContext === 'single') {
+      void (async () => {
+        try {
+          const { resolvedLang } = await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
+            return await fetchPersistAndCache(c, videoId, effectiveLang, ttlSeconds, requestId);
+          });
+          await setAliasIfNoRequested(videoId, requestedLang, resolvedLang, ttlSeconds);
+        } catch (e) {
+          const mapped = mapErrorToHttp(e);
+          await negativeCacheIfLanguageRelated(cacheKey, mapped, requestId);
+        }
+      })();
+    }
+    return { assembled };
+  } catch (dbErr) {
+    logger.error(`${logContext === 'batch' ? 'DB check for transcript (batch)' : 'DB check for transcript'} failed; continuing`, { videoId, language: effectiveLang, requestId, error: dbErr });
+    return { assembled: null };
+  }
+}
+
+// Shared single-fetch used by GET route (mirrors batchFetchOne behavior but returns same shape)
+async function fetchOne(
   c: Context<AppSchema>,
   videoId: string,
   requestedLang: string | undefined | null,
@@ -151,216 +247,128 @@ async function batchFetchOne(
   const cacheKey = buildCacheKey(videoId, effectiveLang);
   const ttlSeconds = c.get('config').TRANSCRIPT_CACHE_TTL_SECONDS;
 
-  const cached = await redisGetJson<any>(cacheKey).catch(() => undefined);
+  const cached = await getCachedJson<any>(cacheKey);
   if (cached) {
-    logger.info('Batch cache hit for transcript', { videoId, language: effectiveLang, requestId });
+    logger.info('Cache hit for transcript', { videoId, language: effectiveLang, requestId, cacheKey });
     if (isNegativeCache(cached)) return { __error: true, error: cached.error, code: cached.code, __status: (cached as any).__status ?? 400 };
     return { data: cached };
   }
-  logger.debug('Batch cache miss for transcript', { videoId, language: effectiveLang, requestId, cacheKey });
 
-  // DB next: if fresh within TTL, assemble and return
-  try {
-    const dbRes = await getTranscriptByVideoAndLanguage(videoId, effectiveLang || '');
-    if (dbRes) {
-      const now = Date.now();
-      const updatedAtMs = new Date(dbRes.updatedAt).getTime();
-      const ageSeconds = Math.max(0, Math.floor((now - updatedAtMs) / 1000));
-      if (ageSeconds < ttlSeconds) {
-        const remaining = Math.max(1, ttlSeconds - ageSeconds);
-        const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, requestId);
-        logger.info('Batch DB hit within TTL for transcript', { videoId, language: dbRes.language, ageSeconds, remaining, requestId });
-        if (!requestedLang) { try { await setAlias(videoId, dbRes.language, remaining); logger.debug('Batch alias set from DB (transcript)', { videoId, language: dbRes.language, remaining, requestId }); } catch { /* noop */ } }
-        return { data: assembled };
-      }
-      logger.info('Batch DB hit but stale for transcript; will fetch', { videoId, language: effectiveLang, ageSeconds, ttlSeconds, requestId });
-    }
-  } catch (dbErr) {
-    logger.error('DB check for transcript (batch) failed; continuing to fetch', { videoId, language: effectiveLang, requestId, error: dbErr });
-  }
+  const fromDb = await tryServeFromDb(c, videoId, effectiveLang, requestedLang, ttlSeconds, requestId, cacheKey, 'single');
+  if (fromDb.assembled) return { data: fromDb.assembled };
 
   try {
-    logger.info('Batch fetching transcript from upstream', { videoId, language: effectiveLang, requestId });
     const { info, resolvedLang } = await singleflight(cacheKey, async () => {
       return await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
         return await fetchPersistAndCache(c, videoId, effectiveLang, ttlSeconds, requestId);
       });
     });
-    if (!requestedLang) { try { await setAlias(videoId, resolvedLang, ttlSeconds); logger.debug('Batch alias set from fetch (transcript)', { videoId, language: resolvedLang, ttlSeconds, requestId }); } catch { /* noop */ } }
+    await setAliasIfNoRequested(videoId, requestedLang, resolvedLang, ttlSeconds);
     return { data: info };
   } catch (e) {
     const mapped = mapErrorToHttp(e);
-    const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode>([
-      ERROR_CODES.INVALID_LANGUAGE,
-      ERROR_CODES.INVALID_TRANSLATE_LANGUAGE,
-      ERROR_CODES.YT_TRANSLATION_UNSUPPORTED,
-      ERROR_CODES.YT_TRANSLATION_SAME_LANGUAGE,
-    ]);
-    if (mapped.status >= 400 && mapped.status < 500 && LANG_RELATED_CODES.has(mapped.code)) {
-      const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); logger.debug('Batch negative-cache set for transcript', { videoId, language: effectiveLang, status: mapped.status, code: mapped.code, requestId }); } catch { /* noop */ }
-    }
+    await negativeCacheIfLanguageRelated(cacheKey, mapped, requestId, 'transcript');
     return { __error: true, error: mapped.message || 'Internal Server Error', code: mapped.code, __status: mapped.status };
   }
 }
 
-v1InnertubeTranscriptRouter.get('/', async (c: Context<AppSchema>) => {
-  const rawId = c.req.query('v');
-  const l = c.req.query('l');
+v1InnertubeTranscriptRouter.get('/', navigationMiddleware(), async (c: Context<AppSchema>) => {
   const requestId = c.get('requestId');
-  // Only negative-cache these language-related 4xx codes
-  const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode>([
-    ERROR_CODES.INVALID_LANGUAGE,
-    ERROR_CODES.INVALID_TRANSLATE_LANGUAGE,
-    ERROR_CODES.YT_TRANSLATION_UNSUPPORTED,
-    ERROR_CODES.YT_TRANSLATION_SAME_LANGUAGE,
-  ]);
+  const langParam = c.req.query('l');
 
-  const QuerySchema = z
-    .object({
-      v: z.string().trim().min(1, 'Missing video id'),
-      l: z.string().trim().optional(),
-    })
-    .superRefine((val, ctx) => {
-      if (val.l !== undefined) {
-        const candidate = val.l.trim();
-        if (candidate.length === 0 || candidate.length > 100) {
-          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l'], message: 'Invalid language' });
-        }
+  // Validate only language param; videoId comes from navigation middleware
+  const LangSchema = z.object({
+    l: z.string().trim().optional(),
+  }).superRefine((val, ctx) => {
+    if (val.l !== undefined) {
+      const candidate = val.l.trim();
+      if (candidate.length === 0 || candidate.length > 100) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l'], message: 'Invalid language' });
       }
-    });
+    }
+  });
 
-  const parsed = QuerySchema.safeParse({ v: rawId, l });
+  const parsed = LangSchema.safeParse({ l: langParam });
   if (!parsed.success) {
     const first = parsed.error.issues[0];
-    const key = String(first.path[0] ?? '');
-    const code = key === 'v' ? ERROR_CODES.BAD_REQUEST : ERROR_CODES.INVALID_LANGUAGE;
     const msg = first.message || 'Bad Request';
     logger.warn('Invalid query parameters for /v1/innertube/transcript', { issues: parsed.error.issues, requestId });
-    return c.json({ error: msg, code }, 400);
+    return c.json({ error: msg, code: ERROR_CODES.INVALID_LANGUAGE }, 400);
   }
 
-  const videoId = parsed.data.v;
+  const navigationEndpoint = c.get('navigationEndpoint') as any;
+  const videoId = navigationEndpoint?.payload?.videoId as string | undefined;
+  if (!videoId) return c.json({ error: 'Missing video id', code: ERROR_CODES.BAD_REQUEST }, 400);
+
   const requestedLang = parsed.data.l ?? '';
-  const { effectiveLang } = await resolveEffectiveLanguage(videoId, requestedLang, requestId);
-  const cacheKey = buildCacheKey(videoId, effectiveLang);
-  const ttlSeconds = c.get('config').TRANSCRIPT_CACHE_TTL_SECONDS;
 
   try {
-    // 1) Cache first
-    const cached = await redisGetJson<any>(cacheKey);
-    if (cached) {
-      logger.info('Cache hit for transcript', { videoId, language: effectiveLang, requestId, cacheKey });
-      if (isNegativeCache(cached)) return c.json({ error: cached.error, code: cached.code }, (cached.__status as any) ?? 400);
-      return c.json(cached);
+    const r = await fetchOne(c, videoId, requestedLang);
+    if ((r as any).__error) {
+      const status = (r as any).__status ?? 400;
+      return c.json({ error: (r as any).error, code: (r as any).code }, status as any);
     }
-
-    // 2) DB next
-    try {
-      const dbRes = await getTranscriptByVideoAndLanguage(videoId, effectiveLang);
-      if (dbRes) {
-        const now = Date.now();
-        const updatedAtMs = new Date(dbRes.updatedAt).getTime();
-        const ageSeconds = Math.max(0, Math.floor((now - updatedAtMs) / 1000));
-        if (ageSeconds < ttlSeconds) {
-          const remaining = Math.max(1, ttlSeconds - ageSeconds);
-          const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, requestId);
-          logger.info('DB hit within TTL for transcript', { videoId, language: dbRes.language, ageSeconds, remaining, requestId });
-          // For no-language requests, set alias to DB language for future fast path
-          if (!requestedLang) {
-            try { await setAlias(videoId, dbRes.language, remaining); } catch { /* noop */ }
-          }
-          return c.json(assembled);
-        }
-        logger.info('DB hit but stale; will fetch YouTube transcript (SWR)', { videoId, language: effectiveLang, ageSeconds, ttlSeconds, requestId });
-        // Serve stale assembled response and refresh in background
-        const assembled = await assembleFromDbAndCache(c, videoId, dbRes, Math.max(1, Math.floor(ttlSeconds / 10)), requestId);
-        void (async () => {
-          const fetchKey = cacheKey;
-          try {
-            const { resolvedLang } = await fetchWithRedisLock(fetchKey, ttlSeconds, async () => {
-              const r = await fetchPersistAndCache(c, videoId, effectiveLang, ttlSeconds, requestId);
-              return r;
-            });
-            if (!requestedLang) { try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch {} }
-          } catch (e) {
-            const mapped = mapErrorToHttp(e);
-            if (mapped.status >= 400 && mapped.status < 500 && LANG_RELATED_CODES.has(mapped.code)) {
-              const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-              try { await redisSetJson(fetchKey, neg, jitterTtl(60)); } catch {}
-            }
-          }
-        })();
-        return c.json(assembled);
-      } else {
-        logger.debug('DB miss for transcript', { videoId, language: effectiveLang, requestId });
-      }
-    } catch (dbErr) {
-      logger.error('DB check for transcript failed; continuing to fetch from YouTube', { videoId, language: effectiveLang, requestId, error: dbErr });
-    }
-
-    // 3) Fetch -> Persist -> Cache (singleflight + distributed lock)
-    const fetchKey = cacheKey;
-    const { info, resolvedLang } = await singleflight(fetchKey, async () => {
-      return await fetchWithRedisLock(fetchKey, ttlSeconds, async () => {
-        const r = await fetchPersistAndCache(c, videoId, effectiveLang, ttlSeconds, requestId);
-        return r;
-      });
-    });
-    // Also set alias so next no-language request can map to resolvedLang
-    if (!requestedLang) {
-      try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch { /* noop */ }
-    }
-    return c.json(info);
+    return c.json((r as any).data);
   } catch (err) {
     const isAbort = isClientAbort(err) || (err instanceof HttpError && (err as HttpError).code === 'EABORT');
     if (isAbort) {
-      logger.info('Request aborted by client', { videoId, language: effectiveLang, requestId });
+      logger.info('Request aborted by client', { videoId, requestId });
       return c.json({ error: 'Client Closed Request', code: ERROR_CODES.CLIENT_CLOSED_REQUEST }, STATUS_CLIENT_CLOSED_REQUEST as any);
     }
     const mapped = mapErrorToHttp(err);
-    // Negative cache for 4xx to reduce repeated work
-    if (mapped.status >= 400 && mapped.status < 500 && LANG_RELATED_CODES.has(mapped.code)) {
-      const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch {}
-    }
-    logger.error('Error in /v1/innertube/transcript', { err, mapped, videoId, language: effectiveLang, requestId });
+    logger.error('Error in /v1/innertube/transcript', { err, mapped, videoId, requestId });
     return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
   }
 });
 
 // POST /v1/innertube/transcript/batch
-v1InnertubeTranscriptRouter.post('/batch', async (c: Context<AppSchema>) => {
+v1InnertubeTranscriptRouter.post('/batch', navigationBatchMiddleware(), async (c: Context<AppSchema>) => {
   const requestId = c.get('requestId');
 
-  const BodySchema = z
-    .object({
-      ids: z.array(z.string().trim().min(1, 'Invalid video id')).min(1, 'ids must not be empty').max(50, 'Max 50 ids per request'),
-      l: z.string().trim().optional(),
-    })
-    .superRefine((val, ctx) => {
-      if (val.l !== undefined) {
-        const candidate = val.l.trim();
-        if (candidate.length === 0 || candidate.length > 100) {
-          ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l'], message: 'Invalid language' });
-        }
+  // Language comes from query to avoid re-consuming JSON body
+  const langParam = c.req.query('l');
+  const LangSchema = z.object({
+    l: z.string().trim().optional(),
+  }).superRefine((val, ctx) => {
+    if (val.l !== undefined) {
+      const candidate = val.l.trim();
+      if (candidate.length === 0 || candidate.length > 100) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['l'], message: 'Invalid language' });
       }
-    });
-
-  let body: unknown;
-  try { body = await c.req.json(); }
-  catch { return c.json({ error: 'Invalid JSON body', code: ERROR_CODES.BAD_REQUEST }, 400); }
-
-  const parsed = BodySchema.safeParse(body);
-  if (!parsed.success) {
-    const first = parsed.error.issues[0];
-    logger.warn('Invalid body for /v1/innertube/transcript/batch', { issues: parsed.error.issues, requestId });
+    }
+  });
+  const parsedLang = LangSchema.safeParse({ l: langParam });
+  if (!parsedLang.success) {
+    const first = parsedLang.error.issues[0];
+    logger.warn('Invalid language for /v1/innertube/transcript/batch', { issues: parsedLang.error.issues, requestId });
     return c.json({ error: first?.message || 'Bad Request', code: ERROR_CODES.BAD_REQUEST }, 400);
   }
+  const l = parsedLang.data.l ?? undefined;
 
-  const seen = new Set<string>();
-  const ids = parsed.data.ids.filter((id) => !seen.has(id) && (seen.add(id), true));
-  const l = parsed.data.l ?? undefined;
+  // Prefer ids prepared by navigationBatchMiddleware
+  const ctxIds = c.get('batchIds') as string[] | undefined;
+  let ids: string[];
+  if (Array.isArray(ctxIds) && ctxIds.length > 0) {
+    ids = ctxIds;
+  } else {
+    // Fallback: accept raw JSON body if middleware did not pre-parse
+    const BodySchema = z.object({
+      ids: z.array(z.string().trim().min(1, 'Invalid video id')).min(1, 'ids must not be empty').max(50, 'Max 50 ids per request'),
+    });
+    let body: unknown;
+    try { body = await c.req.json(); }
+    catch {
+      logger.warn('Invalid JSON body for /v1/innertube/transcript/batch', { requestId });
+      return c.json({ error: 'Invalid JSON body', code: ERROR_CODES.BAD_REQUEST }, 400);
+    }
+    const parsedBody = BodySchema.safeParse(body);
+    if (!parsedBody.success) {
+      const first = parsedBody.error.issues[0];
+      logger.warn('Invalid body for /v1/innertube/transcript/batch', { issues: parsedBody.error.issues, requestId });
+      return c.json({ error: first?.message || 'Bad Request', code: ERROR_CODES.BAD_REQUEST }, 400);
+    }
+    ids = parsedBody.data.ids;
+  }
 
   try {
     const results: Record<string, any> = {};
@@ -370,7 +378,30 @@ v1InnertubeTranscriptRouter.post('/batch', async (c: Context<AppSchema>) => {
     await throttleMap(
       ids,
       async (id) => {
-        const r = await batchFetchOne(c, id, l);
+        // If navigationBatchMiddleware provided mappings, use them to extract videoId
+        const urlById = c.get('batchUrlById') as Map<string, string | null> | undefined;
+        const endpointMap = c.get('navigationEndpointMap') as Map<string, any> | undefined;
+        const url = urlById?.get(id) ?? null;
+        if (!url) {
+          results[id] = { error: 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed', code: ERROR_CODES.BAD_REQUEST };
+          return;
+        }
+        const ep = endpointMap?.get(url);
+        if (!ep) {
+          results[id] = { error: 'Video ID not found', code: ERROR_CODES.BAD_REQUEST };
+          return;
+        }
+        if ((ep as any)?.__error) {
+          results[id] = { error: (ep as any).message, code: (ep as any).code };
+          return;
+        }
+        const videoId = (ep as any)?.payload?.videoId as string | undefined;
+        if (!videoId) {
+          results[id] = { error: 'Video ID not found', code: ERROR_CODES.BAD_REQUEST };
+          return;
+        }
+
+        const r = await fetchOne(c, videoId, l);
         results[id] = (r as any).__error ? { error: (r as any).error, code: (r as any).code } : (r as any).data;
       },
       { concurrency, minDelayMs, maxDelayMs, signal: c.get('signal') }
