@@ -3,9 +3,18 @@ import { describe, expect, test, mock, afterAll } from "bun:test";
 // Mock logger to avoid console noise
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
-  createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {}, verbose() {} }),
-  getLogLevel: () => "info",
-  setLogLevel: (_lvl: any) => {},
+  createLogger: (_scope?: string) => {
+    const logger: any = { debug() {}, info() {}, warn() {}, error() {}, verbose() {} };
+    logger.child = (_child: string) => logger;
+    return logger;
+  },
+  ...(() => {
+    let level = "info" as any;
+    return {
+      getLogLevel: () => level,
+      setLogLevel: (lvl: any) => { level = String(lvl).toLowerCase(); },
+    };
+  })(),
 }));
 
 describe("buildProxyUrlFromConfig()", () => {

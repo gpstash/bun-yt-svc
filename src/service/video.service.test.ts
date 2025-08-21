@@ -3,9 +3,18 @@ import { describe, expect, test, mock, afterAll } from "bun:test";
 // Common logger mock to silence logs
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
-  createLogger: () => ({ debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, verbose: () => {} }),
-  getLogLevel: () => "info",
-  setLogLevel: (_lvl: any) => {},
+  createLogger: (_scope?: string) => {
+    const logger: any = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, verbose: () => {} };
+    logger.child = (_c: string) => logger;
+    return logger;
+  },
+  ...(() => {
+    let level = "info" as any;
+    return {
+      getLogLevel: () => level,
+      setLogLevel: (lvl: any) => { level = String(lvl).toLowerCase(); },
+    };
+  })(),
 }));
 
 function makeDbMock() {
