@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, mock, jest } from "bun:test";
+import { beforeEach, afterEach, describe, expect, it, mock, jest } from "bun:test";
 
 // Mocks must be registered before importing the module under test
 mock.module("@/lib/logger.lib", () => ({
@@ -11,68 +11,17 @@ mock.module("@/lib/logger.lib", () => ({
   }),
 }));
 
-// Minimal http mock that returns a Response
-const http = jest.fn(async (_url: any, _init?: any) => new Response("{\"ok\":true}", { status: 200, headers: { "content-type": "application/json" } }));
-mock.module("@/lib/http.lib", () => ({ http }));
+// Spy on real http.lib export to ensure it affects pre-imported consumers too
+import * as HttpLib from "@/lib/http.lib";
+let http: any;
 
 // Stub PoToken generator to avoid heavy jsdom/youtube calls during unit tests
 const generatePoToken = jest.fn(async () => ({ contentPoToken: "c", sessionPoToken: "s" }));
 mock.module("@/lib/pot.lib", () => ({ generatePoToken }));
 
-// Helper mocks
-const parseVideoInfo = jest.fn((_info: any) => ({
-  id: "vid",
-  captionLanguages: [
-    { languageCode: "en", baseUrl: "https://example/c?fmt=json3", isTranslatable: true },
-    { languageCode: "id", baseUrl: "https://example/c2?fmt=json3", isTranslatable: true },
-  ],
-  captionTranslationLanguages: [
-    { languageCode: "en" },
-    { languageCode: "id" },
-  ],
-}));
-const hasCaptions = jest.fn((_info: any) => true);
-const parseTranscript = jest.fn((_parsedVideoInfo: any, _transcriptInfo: any) => ({
-  id: "vid",
-  transcript: {
-    language: "en",
-    segments: [{ text: "hello", startMs: 0, endMs: 1000 }],
-    text: "hello",
-  },
-}));
-const finCaptionByLanguageCode = jest.fn((caps: any[], lang?: string) => {
-  const target = (lang || "en").toLowerCase();
-  return caps.find(c => c.languageCode?.toLowerCase() === target) || caps[0];
-});
-const buildParsedVideoInfoWithCaption = jest.fn((base: any, decoded: any, lang: string) => ({
-  ...base,
-  caption: {
-    hascaption: true,
-    language: lang,
-    segments: decoded?.segments || [],
-    words: decoded?.words || [],
-    text: decoded?.text || "",
-  },
-}));
-mock.module("@/helper/video.helper", () => ({
-  parseVideoInfo,
-  ParsedVideoInfo: {} as any,
-  hasCaptions,
-  parseTranscript,
-  ParsedVideoInfoWithTranscript: {} as any,
-  finCaptionByLanguageCode,
-  ParsedVideoInfoWithCaption: {} as any,
-}));
-
-const decodeJson3Caption = jest.fn((_text: string) => ({
-  segments: [{ tStartMs: 0, dDurationMs: 500, utf8: "hi" }],
-  words: [{ text: "hi", startMs: 0, endMs: 500 }],
-  text: "hi",
-}));
-mock.module("@/helper/caption.helper", () => ({
-  decodeJson3Caption,
-  buildParsedVideoInfoWithCaption,
-}));
+// Use real helper modules to avoid affecting other tests
+import * as VideoHelper from "@/helper/video.helper";
+import * as CaptionHelper from "@/helper/caption.helper";
 
 // youtubei.js runtime surface mock
 const createInnertubeInstance = () => ({
@@ -98,85 +47,63 @@ const createInnertubeInstance = () => ({
     player: { sts: 123 },
   },
 });
-mock.module("youtubei.js", () => ({
-  Innertube: { create: jest.fn(async (_cfg: any) => createInnertubeInstance()) },
-  ClientType: { WEB_EMBEDDED: "WEB_EMBEDDED" },
-  Log: { setLevel: (_: any) => {}, Level: { INFO: 2 } },
-  UniversalCache: class { constructor(_p: boolean) {} },
-  YT: {},
-  YTNodes: {},
-}));
 
-// After mocks are ready, import the class under test
-import { InnertubeService } from "@/service/innertube.service";
+// After mocks are ready, import the class under test (relative path to bypass alias-based mocks in other tests)
+import { InnertubeService } from "./innertube.service";
 
 // Utility to build a service with a supplied Innertube double
 const makeSvc = (inn?: any) => new InnertubeService((inn || createInnertubeInstance()) as any);
 
 beforeEach(() => {
   jest.clearAllMocks();
-  // reset http default implementation
-  http.mockImplementation(async (_url: any) => new Response("{\"ok\":true}", { status: 200, headers: { "content-type": "application/json" } }));
-  // reset helpers
-  parseVideoInfo.mockImplementation((_info: any) => ({
-    id: "vid",
-    captionLanguages: [
-      { languageCode: "en", baseUrl: "https://example/c?fmt=json3", isTranslatable: true },
-      { languageCode: "id", baseUrl: "https://example/c2?fmt=json3", isTranslatable: true },
-    ],
-    captionTranslationLanguages: [
-      { languageCode: "en" },
-      { languageCode: "id" },
-    ],
-  }));
-  hasCaptions.mockImplementation((_info: any) => true);
-  parseTranscript.mockImplementation((_pvi: any, _ti: any) => ({
-    id: "vid",
-    transcript: { language: "en", segments: [{ text: "hello", startMs: 0, endMs: 1000 }], text: "hello" },
-  }));
-  finCaptionByLanguageCode.mockImplementation((caps: any[], lang?: string) => {
-    const target = (lang || "en").toLowerCase();
-    return caps.find(c => c.languageCode?.toLowerCase() === target) || caps[0];
-  });
-  buildParsedVideoInfoWithCaption.mockImplementation((base: any, decoded: any, lang: string) => ({
-    ...base,
-    caption: { hascaption: true, language: lang, segments: decoded?.segments || [], words: decoded?.words || [], text: decoded?.text || "" },
-  }));
-  decodeJson3Caption.mockImplementation((_text: string) => ({
-    segments: [{ tStartMs: 0, dDurationMs: 500, utf8: "hi" }],
-    words: [{ text: "hi", startMs: 0, endMs: 500 }],
-    text: "hi",
-  }));
+  http = jest.spyOn(HttpLib, "http").mockImplementation(async (_url: any) => new Response("{\"ok\":true}", { status: 200, headers: { "content-type": "application/json" } }));
+  // Reset InnertubeService static state to avoid interference from other tests in the suite
+  const S = InnertubeService as any;
+  try {
+    S.instance = undefined;
+    S.playerAssetCache?.clear?.();
+    S.playerAssetInflight?.clear?.();
+    S.playerInnertube = undefined;
+    S.playerInit = undefined;
+    // do not touch sharedCache intentionally; it's fine to be undefined
+  } catch {}
+});
+
+afterEach(() => {
+  jest.restoreAllMocks();
 });
 
 describe("InnertubeService.getVideoInfo", () => {
   it("parses video info and strips baseUrl from captionLanguages", async () => {
     const svc = makeSvc();
-    // Arrange parseVideoInfo to include baseUrl entries
-    parseVideoInfo.mockImplementation((_i: any) => ({
+    // Spy to arrange parseVideoInfo to include baseUrl entries
+    const spy = jest.spyOn(VideoHelper, "parseVideoInfo").mockImplementation((_i: any) => ({
       id: "vid",
       captionLanguages: [
         { languageCode: "en", baseUrl: "u1", isTranslatable: true },
         { languageCode: "id", baseUrl: "u2", isTranslatable: true },
       ],
       captionTranslationLanguages: [{ languageCode: "en" }],
-    }));
+    } as any));
 
     const out = await svc.getVideoInfo("abc");
 
-    expect(parseVideoInfo).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledTimes(1);
     // Ensure baseUrl removed
     for (const c of out.captionLanguages) {
       expect("baseUrl" in c).toBeFalse();
     }
+    spy.mockRestore();
   });
 });
 
 describe("InnertubeService.getCaption", () => {
   it("returns empty caption when hasCaptions() is false", async () => {
     const svc = makeSvc();
-    hasCaptions.mockImplementation(() => false);
-    parseVideoInfo.mockImplementation(() => ({ id: "vid", captionLanguages: [], captionTranslationLanguages: [] }));
+    // Avoid touching static internals by stubbing the instance method used
+    jest.spyOn(svc as any, "getVideoInfoWithPoToken").mockResolvedValue({} as any);
+    jest.spyOn(VideoHelper, "hasCaptions").mockImplementation(() => false);
+    jest.spyOn(VideoHelper, "parseVideoInfo").mockImplementation(() => ({ id: "vid", captionLanguages: [], captionTranslationLanguages: [] } as any));
 
     const res = await svc.getCaption("abc", "en");
 
@@ -187,16 +114,23 @@ describe("InnertubeService.getCaption", () => {
 
   it("fetches caption JSON3 and builds parsed info; adds tlang when translateLanguage provided", async () => {
     const svc = makeSvc();
-    hasCaptions.mockImplementation(() => true);
-    parseVideoInfo.mockImplementation(() => ({
+    // Avoid static internals
+    jest.spyOn(svc as any, "getVideoInfoWithPoToken").mockResolvedValue({} as any);
+    jest.spyOn(VideoHelper, "hasCaptions").mockImplementation(() => true);
+    jest.spyOn(VideoHelper, "parseVideoInfo").mockImplementation(() => ({
       id: "vid",
       captionLanguages: [
         { languageCode: "en", baseUrl: "https://timed/text?fmt=json3", isTranslatable: true },
       ],
       captionTranslationLanguages: [{ languageCode: "id" }],
-    }));
+    } as any));
 
     http.mockImplementation(async (url: any) => new Response("{\"text\":\"hi\"}", { status: 200 }));
+
+    // We don't return actual JSON3 in the mock HTTP response; stub decoder to expected shape
+    jest
+      .spyOn(CaptionHelper, "decodeJson3Caption")
+      .mockReturnValue({ language: "en", segments: [], words: [], text: "hi" });
 
     const res = await svc.getCaption("abc", "en", "id");
 
@@ -206,7 +140,6 @@ describe("InnertubeService.getCaption", () => {
     expect(u.searchParams.get("tlang")).toBe("id");
     expect(u.searchParams.get("fmt")).toBe("json3");
 
-    expect(buildParsedVideoInfoWithCaption).toHaveBeenCalledTimes(1);
     expect(res.caption.language).toBe("en");
     expect(res.caption.text).toBe("hi");
   });
@@ -232,29 +165,62 @@ describe("InnertubeService.getTranscript", () => {
     });
 
     const svc = makeSvc(inn);
+    // Avoid touching real getInfo retry logic by stubbing the instance method
+    jest.spyOn(svc as any, "getVideoInfoRawWithRetries").mockResolvedValue({
+      playability_status: { status: "OK" },
+      has_trailer: false,
+      getTrailerInfo: () => ({ basic_info: {}, playability_status: {}, streaming_data: {} }),
+      basic_info: { start_timestamp: null, duration: 123 },
+      captions: { caption_tracks: [{ base_url: "https://cc?fmt=json3" }] },
+      storyboards: {},
+      streaming_data: { dash_manifest_url: "https://dash/manifest.mpd" },
+      getTranscript: async () => ({
+        languages: ["en", "id"],
+        selectLanguage: async (_lang: string) => ({ /* selected */ }),
+      }),
+    } as any);
+    const spy = jest.spyOn(VideoHelper, "parseTranscript").mockImplementation((_pvi: any, _ti: any) => ({
+      id: "vid",
+      transcript: {
+        language: "en",
+        segments: [{ text: "hello", startMs: 0, endMs: 1000 }],
+        text: "hello",
+      },
+    } as any));
     const out = await svc.getTranscript("abc", "en");
 
-    expect(parseTranscript).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledTimes(1);
     expect(out.transcript.segments.length).toBe(1);
     expect(out.transcript.text).toBe("hello");
+    spy.mockRestore();
   });
 });
 
 describe("InnertubeService.getChannel", () => {
   it("calls innertube.getChannel and returns parsed channel", async () => {
-    // Mock parseChannelInfo via module factory
-    const parseChannelInfo = jest.fn(async (c: any) => ({ id: c.id, title: "T" } as any));
-    mock.module("@/helper/channel.helper", () => ({ parseChannelInfo }));
     const inn = createInnertubeInstance();
-    (inn as any).getChannel = async (id: string) => ({ id });
+    (inn as any).getChannel = async (id: string) => ({
+      getAbout: async () => ({ metadata: { description: "about desc", subscriber_count: "1", view_count: "2", joined_date: { text: "J" }, video_count: "3", country: "US" } }),
+      metadata: {
+        external_id: id,
+        title: "Chan",
+        url: `https://www.youtube.com/channel/${id}`,
+        vanity_channel_url: "https://youtube.com/@chan",
+        is_family_safe: true,
+        keywords: ["k1"],
+        avatar: { url: "a", width: 1, height: 1 },
+        thumbnail: { url: "t", width: 1, height: 1 },
+        tags: ["t1"],
+        is_unlisted: false,
+      },
+    });
 
-    // Re-import service to pick updated channel.helper mock for this test scope
-    const { InnertubeService: ReSvc } = await import("@/service/innertube.service");
-    const svc = new ReSvc(inn as any);
+    const svc = await makeSvc(inn);
     const res = await svc.getChannel("CID");
 
-    expect(parseChannelInfo).toHaveBeenCalledTimes(1);
     expect(res.id).toBe("CID");
+    expect(res.title).toBe("Chan");
+    expect(res.description).toBe("about desc");
   });
 });
 

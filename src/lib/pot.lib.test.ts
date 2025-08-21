@@ -1,4 +1,4 @@
-import { describe, expect, test, mock } from "bun:test";
+import { describe, expect, test, mock, afterEach, jest } from "bun:test";
 
 // Silence logger
 mock.module("@/lib/logger.lib", () => ({ createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }) }));
@@ -34,20 +34,7 @@ mock.module("bgutils-js", () => ({
   },
 }));
 
-// Mock InnertubeService
-mock.module("@/service/innertube.service", () => ({
-  InnertubeService: {
-    createInnertube: async (_opts: any) => ({
-      getAttestationChallenge: async (_t: string) => ({
-        bg_challenge: {
-          program: "prog",
-          global_name: "gn",
-          interpreter_url: { private_do_not_access_or_else_trusted_resource_url_wrapped_value: "//interp.js" },
-        }
-      })
-    })
-  }
-}));
+// Note: Avoid alias-wide mock of InnertubeService to prevent leaking to other test files
 
 // Mock http.lib to serve interpreter js and GenerateIT response
 mock.module("@/lib/http.lib", () => ({
@@ -59,7 +46,21 @@ mock.module("@/lib/http.lib", () => ({
 }));
 
 describe("generatePoToken()", () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   test("returns content and session tokens after mocked flow", async () => {
+    const SvcMod = await import("@/service/innertube.service");
+    jest.spyOn(SvcMod.InnertubeService, "createInnertube").mockResolvedValue({
+      getAttestationChallenge: async (_t: string) => ({
+        bg_challenge: {
+          program: "prog",
+          global_name: "gn",
+          interpreter_url: { private_do_not_access_or_else_trusted_resource_url_wrapped_value: "//interp.js" },
+        }
+      })
+    } as any);
     const { generatePoToken } = await import("./pot.lib");
     const res = await generatePoToken("vid", encodeURIComponent("visitor"));
     expect(res.contentPoToken).toBe("tok:vid");
@@ -68,9 +69,10 @@ describe("generatePoToken()", () => {
 
   test("propagates error when challenge missing", async () => {
     // Override InnertubeService to return no bg_challenge
-    mock.module("@/service/innertube.service", () => ({
-      InnertubeService: { createInnertube: async () => ({ getAttestationChallenge: async () => ({}) }) }
-    }));
+    const SvcMod = await import("@/service/innertube.service");
+    jest.spyOn(SvcMod.InnertubeService, "createInnertube").mockResolvedValue({
+      getAttestationChallenge: async () => ({})
+    } as any);
     const { generatePoToken } = await import("./pot.lib");
     await expect(generatePoToken("vid", "visitor")).rejects.toThrow(/Could not get challenge/);
   });
