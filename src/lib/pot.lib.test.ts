@@ -1,7 +1,10 @@
 import { describe, expect, test, mock, afterEach, afterAll, jest } from "bun:test";
 
 // Silence logger
-mock.module("@/lib/logger.lib", () => ({ __esModule: true, createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }) }));
+mock.module("@/lib/logger.lib", () => ({
+  __esModule: true,
+  createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }),
+}));
 
 // Mock jsdom to provide window/document
 mock.module("jsdom", () => ({
@@ -72,7 +75,7 @@ describe("generatePoToken()", () => {
         }
       })
     } as any);
-    const { generatePoToken } = await import("./pot.lib");
+    const { generatePoToken } = await import("@/lib/pot.lib");
     const res = await generatePoToken("vid", "visitor");
     expect(res.contentPoToken).toBe("tok:vid");
     expect(res.sessionPoToken).toBe("tok:visitor");
@@ -84,7 +87,7 @@ describe("generatePoToken()", () => {
     jest.spyOn(SvcMod.InnertubeService, "createInnertube").mockResolvedValue({
       getAttestationChallenge: async () => ({})
     } as any);
-    const { generatePoToken } = await import("./pot.lib");
+    const { generatePoToken } = await import("@/lib/pot.lib");
     await expect(generatePoToken("vid", "visitor")).rejects.toThrow(/Could not get challenge/);
   });
 });

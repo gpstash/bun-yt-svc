@@ -10,9 +10,12 @@ mock.module("@/lib/logger.lib", () => ({
     error: jest.fn(),
     verbose: jest.fn(),
   }),
+  // Provide level APIs so tests importing them won't crash if this mock leaks
+  getLogLevel: () => "info",
+  setLogLevel: (_lvl: any) => {},
 }));
 
-// Ensure we don't leak logger mock to other test files
+// Ensure we don't leak mocks to other test files
 afterAll(() => {
   mock.module("@/lib/logger.lib", () => import("@/lib/logger.lib"));
 });
@@ -21,9 +24,7 @@ afterAll(() => {
 import * as HttpLib from "@/lib/http.lib";
 let http: any;
 
-// Stub PoToken generator to avoid heavy jsdom/youtube calls during unit tests
-const generatePoToken = jest.fn(async () => ({ contentPoToken: "c", sessionPoToken: "s" }));
-mock.module("@/lib/pot.lib", () => ({ generatePoToken }));
+// Do not mock pot.lib globally; tests stub instance methods to avoid PoToken paths when needed
 
 // Use real helper modules to avoid affecting other tests
 import * as VideoHelper from "@/helper/video.helper";

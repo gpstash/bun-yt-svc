@@ -1,9 +1,9 @@
-import { describe, expect, test, mock } from "bun:test";
+import { describe, expect, test, mock, afterAll } from "bun:test";
 
 // Silence logs
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
-  createLogger: () => ({ debug: () => {}, warn: () => {} }),
+  createLogger: () => ({ debug: () => {}, warn: () => {}, info: () => {}, error: () => {}, verbose: () => {} }),
 }));
 
 describe("caption.service", () => {
@@ -100,5 +100,10 @@ describe("caption.service", () => {
     expect(await mod.getPreferredCaptionLanguage("v")).toBeNull();
     expect(await mod.upsertCaption("v", "en", { segments: [], words: [] })).toEqual({ upserted: false });
     expect(await mod.getCaptionByVideoAndLanguage("v", "en")).toBeNull();
+  });
+
+  // Restore real logger after suite
+  afterAll(() => {
+    mock.module("@/lib/logger.lib", () => import("@/lib/logger.lib"));
   });
 });

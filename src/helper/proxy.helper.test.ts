@@ -1,7 +1,10 @@
 import { describe, expect, test, mock, afterAll } from "bun:test";
 
 // Mock logger to avoid console noise
-mock.module("@/lib/logger.lib", () => ({ __esModule: true, createLogger: () => ({ debug() {}, info() {}, warn() {} }) }));
+mock.module("@/lib/logger.lib", () => ({
+  __esModule: true,
+  createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {}, verbose() {} }),
+}));
 
 describe("buildProxyUrlFromConfig()", () => {
   test("returns undefined when PROXY_STATUS is inactive", async () => {

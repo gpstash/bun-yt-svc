@@ -1,9 +1,11 @@
-import { describe, expect, test, mock } from "bun:test";
+import { describe, expect, test, mock, afterAll } from "bun:test";
 
 // Common logger mock to silence logs
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
-  createLogger: () => ({ debug: () => {}, warn: () => {} }),
+  createLogger: () => ({ debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, verbose: () => {} }),
+  getLogLevel: () => "info",
+  setLogLevel: (_lvl: any) => {},
 }));
 
 function makeDbMock() {
@@ -151,4 +153,9 @@ describe("video.service", () => {
     const got = await mod.getVideoById("x");
     expect(got).toBeNull();
   });
+});
+
+// Restore real logger to avoid leaking mocks
+afterAll(() => {
+  mock.module("@/lib/logger.lib", () => import("@/lib/logger.lib"));
 });

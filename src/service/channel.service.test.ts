@@ -1,9 +1,9 @@
-import { describe, expect, test, mock } from "bun:test";
+import { describe, expect, test, mock, afterAll } from "bun:test";
 
 // Silence logs
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
-  createLogger: () => ({ debug: () => {}, warn: () => {} }),
+  createLogger: () => ({ debug: () => {}, warn: () => {}, info: () => {}, error: () => {}, verbose: () => {} }),
 }));
 
 describe("channel.service", () => {
@@ -85,4 +85,9 @@ describe("channel.service", () => {
     expect(res.upserted).toBeFalse();
     expect(await mod.getChannelById("UC1")).toBeNull();
   });
+});
+
+// Restore real logger after suite
+afterAll(() => {
+  mock.module("@/lib/logger.lib", () => import("@/lib/logger.lib"));
 });

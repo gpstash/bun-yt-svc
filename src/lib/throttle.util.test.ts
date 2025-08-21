@@ -1,6 +1,9 @@
-import { describe, expect, test, mock } from "bun:test";
+import { describe, expect, test, mock, afterAll } from "bun:test";
 // Silence and provide debug
-mock.module("@/lib/logger.lib", () => ({ createLogger: () => ({ debug() {}, info() {}, warn() {}, verbose() {}, error() {} }) }));
+mock.module("@/lib/logger.lib", () => ({
+  __esModule: true,
+  createLogger: () => ({ debug() {}, info() {}, warn() {}, verbose() {}, error() {} }),
+}));
 // Import lazily inside tests to ensure mocks are applied first
 
 describe("throttle.util throttleMap()", () => {
@@ -45,4 +48,9 @@ describe("dedupeOrdered()", () => {
     const out = dedupeOrdered(arr);
     expect(out).toEqual([1,2,3,4]);
   });
+});
+
+// Restore real logger to avoid leaking mocks
+afterAll(() => {
+  mock.module("@/lib/logger.lib", () => import("@/lib/logger.lib"));
 });
