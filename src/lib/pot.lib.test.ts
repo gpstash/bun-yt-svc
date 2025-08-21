@@ -73,7 +73,7 @@ describe("generatePoToken()", () => {
       })
     } as any);
     const { generatePoToken } = await import("./pot.lib");
-    const res = await generatePoToken("vid", encodeURIComponent("visitor"));
+    const res = await generatePoToken("vid", "visitor");
     expect(res.contentPoToken).toBe("tok:vid");
     expect(res.sessionPoToken).toBe("tok:visitor");
   });

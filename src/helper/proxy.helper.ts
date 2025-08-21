@@ -15,10 +15,10 @@ export function buildProxyUrlFromConfig(): string | undefined {
     if (!host || !port) return undefined;
     const user = cfg.PROXY_USERNAME;
     const pass = cfg.PROXY_PASSWORD;
-    const auth = user ? `${encodeURIComponent(user)}${pass ? ':' + encodeURIComponent(pass) : ''}@` : '';
+    const auth = user && user.trim() ? `${encodeURIComponent(user)}${pass ? ':' + encodeURIComponent(pass) : ''}@` : '';
     const url = `http://${auth}${host}:${port}`;
     // Redact credentials in logs
-    logger.info('proxy url built', { host, port, hasAuth: Boolean(user) });
+    logger.info('proxy url built', { host, port, hasAuth: Boolean(user && user.trim()) });
     return url;
   } catch {
     logger.warn('failed to build proxy url');

@@ -8,8 +8,10 @@ describe("cache.util", () => {
       const v = jitterTtl(ttl);
       expect(v).toBeGreaterThanOrEqual(900);
       expect(v).toBeLessThanOrEqual(1100);
+      expect(v).toBeGreaterThanOrEqual(1);
     }
     expect(jitterTtl(0)).toBeGreaterThanOrEqual(1);
+    expect(jitterTtl(-5)).toBeGreaterThanOrEqual(1);
   });
 
   test("singleflight coalesces concurrent calls per key", async () => {
