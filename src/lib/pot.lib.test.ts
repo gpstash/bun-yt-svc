@@ -1,0 +1,77 @@
+import { describe, expect, test, mock } from "bun:test";
+
+// Silence logger
+mock.module("@/lib/logger.lib", () => ({ createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }) }));
+
+// Mock jsdom to provide window/document
+mock.module("jsdom", () => ({
+  JSDOM: class {
+    window: any;
+    constructor(_html: string, _opts: any) {
+      this.window = {
+        document: {},
+        location: { href: "https://www.youtube.com/" },
+        origin: "https://www.youtube.com",
+        navigator: { userAgent: "ua" },
+      };
+    }
+  }
+}));
+
+// Mock bgutils-js
+mock.module("bgutils-js", () => ({
+  USER_AGENT: "ua",
+  GOOG_API_KEY: "key",
+  buildURL: (name: string, _bool: boolean) => `https://example.com/${name}`,
+  BG: {
+    BotGuardClient: {
+      create: async (_args: any) => ({ snapshot: async (_opts: any) => ({ token: "botguard-token" }) }),
+    },
+    WebPoMinter: {
+      create: async (_args: any, _out: any) => ({ mintAsWebsafeString: async (v: string) => `tok:${v}` }),
+    },
+    PoToken: { generateColdStartToken: (_v: string) => "cold" },
+  },
+}));
+
+// Mock InnertubeService
+mock.module("@/service/innertube.service", () => ({
+  InnertubeService: {
+    createInnertube: async (_opts: any) => ({
+      getAttestationChallenge: async (_t: string) => ({
+        bg_challenge: {
+          program: "prog",
+          global_name: "gn",
+          interpreter_url: { private_do_not_access_or_else_trusted_resource_url_wrapped_value: "//interp.js" },
+        }
+      })
+    })
+  }
+}));
+
+// Mock http.lib to serve interpreter js and GenerateIT response
+mock.module("@/lib/http.lib", () => ({
+  http: async (url: string, _init?: any, _opts?: any) => {
+    if (String(url).includes("interp.js")) return new Response("console.log('interp')", { status: 200 });
+    if (String(url).includes("GenerateIT")) return new Response(JSON.stringify(["integrityToken123"]), { status: 200, headers: { "content-type": "application/json" } });
+    return new Response("ok");
+  }
+}));
+
+describe("generatePoToken()", () => {
+  test("returns content and session tokens after mocked flow", async () => {
+    const { generatePoToken } = await import("./pot.lib");
+    const res = await generatePoToken("vid", encodeURIComponent("visitor"));
+    expect(res.contentPoToken).toBe("tok:vid");
+    expect(res.sessionPoToken).toBe("tok:visitor");
+  });
+
+  test("propagates error when challenge missing", async () => {
+    // Override InnertubeService to return no bg_challenge
+    mock.module("@/service/innertube.service", () => ({
+      InnertubeService: { createInnertube: async () => ({ getAttestationChallenge: async () => ({}) }) }
+    }));
+    const { generatePoToken } = await import("./pot.lib");
+    await expect(generatePoToken("vid", "visitor")).rejects.toThrow(/Could not get challenge/);
+  });
+});

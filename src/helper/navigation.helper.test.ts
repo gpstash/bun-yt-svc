@@ -271,10 +271,8 @@ describe('resolveNavigationWithCache', () => {
     const calls: any[] = [];
     let cache: Record<string, any> = {};
 
-    mock.module('@/lib/cache.util', () => ({
-      jitterTtl: (ttl: number) => ttl, // identity for test predictability
-    }));
-
+    // Mock cache and redis for this test case only
+    mock.module('@/lib/cache.util', () => ({ jitterTtl: (ttl: number) => ttl }));
     mock.module('@/lib/redis.lib', () => ({
       redisGetJson: async (key: string) => {
         calls.push({ fn: 'get', key });
