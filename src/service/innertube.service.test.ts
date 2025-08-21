@@ -1,4 +1,4 @@
-import { beforeEach, afterEach, describe, expect, it, mock, jest } from "bun:test";
+import { beforeEach, afterEach, afterAll, describe, expect, it, mock, jest } from "bun:test";
 
 // Mocks must be registered before importing the module under test
 mock.module("@/lib/logger.lib", () => ({
@@ -11,6 +11,11 @@ mock.module("@/lib/logger.lib", () => ({
     verbose: jest.fn(),
   }),
 }));
+
+// Ensure we don't leak logger mock to other test files
+afterAll(() => {
+  mock.module("@/lib/logger.lib", () => import("@/lib/logger.lib"));
+});
 
 // Spy on real http.lib export to ensure it affects pre-imported consumers too
 import * as HttpLib from "@/lib/http.lib";

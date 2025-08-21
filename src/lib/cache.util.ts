@@ -2,9 +2,12 @@ import { redisAcquireLock, redisReleaseLock, redisWaitForKey } from '@/lib/redis
 
 // Add small TTL jitter (±10%) to avoid synchronized expirations (stampedes)
 export function jitterTtl(ttlSeconds: number): number {
-  const jitter = 0.1 * ttlSeconds;
+  // Normalize and guard
+  const base = Number(ttlSeconds);
+  if (!isFinite(base) || base <= 0) return 1;
+  const jitter = 0.1 * base;
   const delta = (Math.random() * 2 - 1) * jitter;
-  return Math.max(1, Math.floor(ttlSeconds + delta));
+  return Math.max(1, Math.floor(base + delta));
 }
 
 // In-process singleflight: coalesce concurrent identical work in the same instance

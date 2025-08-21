@@ -1,4 +1,4 @@
-import { describe, expect, test, mock } from "bun:test";
+import { describe, expect, test, mock, afterAll } from "bun:test";
 
 // Mock logger to avoid console noise
 mock.module("@/lib/logger.lib", () => ({ __esModule: true, createLogger: () => ({ debug() {}, info() {}, warn() {} }) }));
@@ -26,5 +26,11 @@ describe("buildProxyUrlFromConfig()", () => {
     mock.module("@/config", () => ({ __esModule: true, parseConfig: () => { throw new Error("boom"); } }));
     const { buildProxyUrlFromConfig } = await import("./proxy.helper");
     expect(buildProxyUrlFromConfig()).toBeUndefined();
+  });
+
+  // Restore real modules to avoid leaking mocks to other test files
+  afterAll(() => {
+    mock.module("@/lib/logger.lib", () => import("@/lib/logger.lib"));
+    mock.module("@/config", () => import("@/config"));
   });
 });

@@ -1,4 +1,4 @@
-import { describe, expect, test, mock, afterEach, jest } from "bun:test";
+import { describe, expect, test, mock, afterEach, afterAll, jest } from "bun:test";
 
 // Silence logger
 mock.module("@/lib/logger.lib", () => ({ __esModule: true, createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }) }));
@@ -51,6 +51,14 @@ mock.module("@/lib/http.lib", () => ({
 describe("generatePoToken()", () => {
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  // Restore real modules to avoid leaking to other tests
+  afterAll(() => {
+    mock.module("@/lib/logger.lib", () => import("@/lib/logger.lib"));
+    mock.module("jsdom", () => import("jsdom"));
+    mock.module("bgutils-js", () => import("bgutils-js"));
+    mock.module("@/lib/http.lib", () => import("@/lib/http.lib"));
   });
 
   test("returns content and session tokens after mocked flow", async () => {
