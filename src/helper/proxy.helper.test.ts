@@ -4,6 +4,8 @@ import { describe, expect, test, mock, afterAll } from "bun:test";
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
   createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {}, verbose() {} }),
+  getLogLevel: () => "info",
+  setLogLevel: (_lvl: any) => {},
 }));
 
 describe("buildProxyUrlFromConfig()", () => {
