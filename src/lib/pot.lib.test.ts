@@ -3,9 +3,12 @@ import { describe, expect, test, mock, afterEach, afterAll, jest } from "bun:tes
 // Silence logger
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
-  createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }),
-  getLogLevel: () => "info",
-  setLogLevel: (_lvl: any) => {},
+  createLogger: (_s?: string) => {
+    const logger: any = { debug() {}, info() {}, warn() {}, error() {}, verbose() {} };
+    logger.child = (_c: string) => logger;
+    return logger;
+  },
+  ...(() => { let level = "info" as any; return { getLogLevel: () => level, setLogLevel: (l: any) => { level = String(l).toLowerCase(); } }; })(),
 }));
 
 // Mock jsdom to provide window/document

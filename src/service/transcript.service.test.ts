@@ -3,9 +3,12 @@ import { describe, expect, test, mock, afterAll } from "bun:test";
 // Silence logs
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
-  createLogger: () => ({ debug: () => {}, warn: () => {}, info: () => {}, error: () => {}, verbose: () => {} }),
-  getLogLevel: () => "info",
-  setLogLevel: (_lvl: any) => {},
+  createLogger: (_s?: string) => {
+    const logger: any = { debug: () => {}, warn: () => {}, info: () => {}, error: () => {}, verbose: () => {} };
+    logger.child = (_c: string) => logger;
+    return logger;
+  },
+  ...(() => { let level = "info" as any; return { getLogLevel: () => level, setLogLevel: (l: any) => { level = String(l).toLowerCase(); } }; })(),
 }));
 
 describe("transcript.service", () => {

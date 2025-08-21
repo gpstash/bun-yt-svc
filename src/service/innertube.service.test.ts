@@ -1,19 +1,23 @@
-import { beforeEach, afterEach, afterAll, describe, expect, it, mock, jest } from "bun:test";
+import { beforeEach, afterEach, afterAll, describe, expect, it, mock, jest, beforeAll as suiteBeforeAll } from "bun:test";
 
-// Mocks must be registered before importing the module under test
-mock.module("@/lib/logger.lib", () => ({
-  __esModule: true,
-  createLogger: () => ({
-    debug: jest.fn(),
-    info: jest.fn(),
-    warn: jest.fn(),
-    error: jest.fn(),
-    verbose: jest.fn(),
-  }),
-  // Provide level APIs so tests importing them won't crash if this mock leaks
-  getLogLevel: () => "info",
-  setLogLevel: (_lvl: any) => {},
-}));
+// Limit logger mock to this suite lifecycle to avoid leaking across files
+suiteBeforeAll(() => {
+  mock.module("@/lib/logger.lib", () => ({
+    __esModule: true,
+    createLogger: () => {
+      const logger: any = {
+        debug: jest.fn(),
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+        verbose: jest.fn(),
+      };
+      logger.child = (_c: string) => logger;
+      return logger;
+    },
+    ...(() => { let level = "info" as any; return { getLogLevel: () => level, setLogLevel: (l: any) => { level = String(l).toLowerCase(); } }; })(),
+  }));
+});
 
 // Ensure we don't leak mocks to other test files
 afterAll(() => {
