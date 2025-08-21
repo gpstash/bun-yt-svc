@@ -1,8 +1,16 @@
-import { describe, expect, mock, test, afterAll } from "bun:test";
+import { describe, expect, mock, test, afterAll, beforeAll } from "bun:test";
 
 describe("cache.util", () => {
+  const realUrl = new URL(`./cache.util.ts?ts=${Date.now()}`, import.meta.url).href;
+
+  let origRandom: typeof Math.random;
+  beforeAll(() => { origRandom = Math.random; });
+  afterAll(() => { Math.random = origRandom; });
+
   test("jitterTtl within ±10% and >=1", async () => {
-    const { jitterTtl } = await import("./cache.util");
+    const { jitterTtl } = await import(realUrl);
+    // Make randomness deterministic for range assertions
+    Math.random = () => 0.5; // delta = 0
     const ttl = 1000;
     for (let i = 0; i < 50; i++) {
       const v = jitterTtl(ttl);
@@ -10,6 +18,7 @@ describe("cache.util", () => {
       expect(v).toBeLessThanOrEqual(1100);
       expect(v).toBeGreaterThanOrEqual(1);
     }
+    // Edge guards
     expect(jitterTtl(0)).toBeGreaterThanOrEqual(1);
     expect(jitterTtl(-5)).toBeGreaterThanOrEqual(1);
   });

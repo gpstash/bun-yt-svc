@@ -2,9 +2,12 @@ import { describe, expect, test, mock, afterAll } from "bun:test";
 // Silence and provide debug
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
-  createLogger: () => ({ debug() {}, info() {}, warn() {}, verbose() {}, error() {} }),
-  getLogLevel: () => "info",
-  setLogLevel: (_lvl: any) => {},
+  createLogger: (_s?: string) => {
+    const logger: any = { debug() {}, info() {}, warn() {}, verbose() {}, error() {} };
+    logger.child = (_c: string) => logger;
+    return logger;
+  },
+  ...(() => { let level = "info" as any; return { getLogLevel: () => level, setLogLevel: (l: any) => { level = String(l).toLowerCase(); } }; })(),
 }));
 // Import lazily inside tests to ensure mocks are applied first
 
