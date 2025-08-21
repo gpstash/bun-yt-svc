@@ -17,7 +17,20 @@ function createClient(): Redis | undefined {
     logger.warn('REDIS_URL not set. Redis cache disabled.');
     return undefined;
   }
-  const redis = new Redis(REDIS_URL);
+  const redis = new Redis(REDIS_URL, {
+    // Do not connect immediately at boot; we'll connect on first use
+    lazyConnect: true,
+    // Fail fast: do not queue commands when offline, and do not endlessly retry a single command
+    enableOfflineQueue: false,
+    autoResubscribe: false,
+    autoResendUnfulfilledCommands: false,
+    maxRetriesPerRequest: 1,
+    // Backoff and stop reconnecting after a few attempts to avoid infinite loops on DNS errors
+    retryStrategy: (times) => {
+      if (times > 5) return null; // stop retrying after N attempts
+      return Math.min(times * 200, 2000); // backoff up to 2s
+    },
+  });
   // Build a safe URL for logs (mask password)
   const safeUrl = (() => {
     try {
