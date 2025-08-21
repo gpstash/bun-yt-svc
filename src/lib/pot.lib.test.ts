@@ -4,6 +4,8 @@ import { describe, expect, test, mock, afterEach, afterAll, jest } from "bun:tes
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
   createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }),
+  getLogLevel: () => "info",
+  setLogLevel: (_lvl: any) => {},
 }));
 
 // Mock jsdom to provide window/document

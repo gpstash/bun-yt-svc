@@ -3,6 +3,8 @@ import { describe, expect, test, mock, afterAll } from "bun:test";
 mock.module("@/lib/logger.lib", () => ({
   __esModule: true,
   createLogger: () => ({ debug() {}, info() {}, warn() {}, verbose() {}, error() {} }),
+  getLogLevel: () => "info",
+  setLogLevel: (_lvl: any) => {},
 }));
 // Import lazily inside tests to ensure mocks are applied first
 
