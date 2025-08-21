@@ -17,6 +17,8 @@ export const configSchema = z.object({
   INNERTUBE_BATCH_CONCURRENCY: z.coerce.number().int().positive().max(10).default(3),
   INNERTUBE_BATCH_MIN_DELAY_MS: z.coerce.number().int().positive().default(150),
   INNERTUBE_BATCH_MAX_DELAY_MS: z.coerce.number().int().positive().default(400),
+  // Bun.serve idle timeout (seconds). Default Bun is 10s; increase for long requests
+  IDLE_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(120),
 });
 
 export type AppConfig = z.infer<typeof configSchema>;

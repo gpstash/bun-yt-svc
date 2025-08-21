@@ -78,7 +78,7 @@ export interface ParsedVideoInfoWithTranscript extends ParsedVideoInfo {
 export type CaptionFormat = 'srv3' | 'srv2' | 'srv1' | 'vtt' | 'ttml' | 'srt';
 const CAPTION_FORMATS: CaptionFormat[] = ['srv3', 'srv2', 'srv1', 'vtt', 'ttml', 'srt'];
 
-function generateThumbnails(videoId: string): Thumbnail[] {
+export function generateThumbnails(videoId: string): Thumbnail[] {
   if (!videoId) return [];
   const baseUrl = `https://img.youtube.com/vi/${videoId}/`;
   return [

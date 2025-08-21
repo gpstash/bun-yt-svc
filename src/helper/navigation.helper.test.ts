@@ -289,11 +289,12 @@ describe('resolveNavigationWithCache', () => {
 
     // Miss path (watch URL)
     const urlWatch = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+    const keyWatch = `yt:navigation:watch:${Buffer.from(urlWatch, 'utf-8').toString('base64')}`;
     const innertube = { resolveURL: async (_u: string) => ({ type: 'watch', v: 'dQw4w9WgXcQ' }) };
     const config = { VIDEO_CACHE_TTL_SECONDS: 300, CHANNEL_CACHE_TTL_SECONDS: 600 };
     const resWatch1 = await resolveNavigationWithCache(innertube, urlWatch, config);
     expect(resWatch1).toEqual({ type: 'watch', v: 'dQw4w9WgXcQ' });
-    expect(cache[`yt:navigation:watch:${urlWatch}`]).toEqual(resWatch1);
+    expect(cache[keyWatch]).toEqual(resWatch1);
 
     // Hit path (watch URL)
     const resWatch2 = await resolveNavigationWithCache(innertube, urlWatch, config);
@@ -301,22 +302,23 @@ describe('resolveNavigationWithCache', () => {
 
     // Miss path (channel URL)
     const urlChannel = 'https://www.youtube.com/@handle123';
+    const keyChannel = `yt:navigation:channel:${Buffer.from(urlChannel, 'utf-8').toString('base64')}`;
     const resChannel1 = await resolveNavigationWithCache(
       { resolveURL: async (_u: string) => ({ type: 'channel', h: '@handle123' }) },
       urlChannel,
       config,
     );
     expect(resChannel1).toEqual({ type: 'channel', h: '@handle123' });
-    expect(cache[`yt:navigation:channel:${urlChannel}`]).toEqual(resChannel1);
+    expect(cache[keyChannel]).toEqual(resChannel1);
 
     // Hit path (channel URL)
     const resChannel2 = await resolveNavigationWithCache(innertube, urlChannel, config);
     expect(resChannel2).toEqual(resChannel1);
 
     // Validate calls order includes get/set interactions
-    expect(calls.some(c => c.fn === 'get' && c.key === `yt:navigation:watch:${urlWatch}`)).toBe(true);
-    expect(calls.some(c => c.fn === 'set' && c.key === `yt:navigation:watch:${urlWatch}` && c.ttl === 300)).toBe(true);
-    expect(calls.some(c => c.fn === 'get' && c.key === `yt:navigation:channel:${urlChannel}`)).toBe(true);
-    expect(calls.some(c => c.fn === 'set' && c.key === `yt:navigation:channel:${urlChannel}` && c.ttl === 600)).toBe(true);
+    expect(calls.some(c => c.fn === 'get' && c.key === keyWatch)).toBe(true);
+    expect(calls.some(c => c.fn === 'set' && c.key === keyWatch && c.ttl === 300)).toBe(true);
+    expect(calls.some(c => c.fn === 'get' && c.key === keyChannel)).toBe(true);
+    expect(calls.some(c => c.fn === 'set' && c.key === keyChannel && c.ttl === 600)).toBe(true);
   });
 });

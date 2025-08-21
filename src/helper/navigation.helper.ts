@@ -172,12 +172,16 @@ function isChannelIdPath(pathname: string): boolean {
   return re.test(pathname);
 }
 
+function encodeUrl(url: string): string {
+  return Buffer.from(url, 'utf-8').toString('base64');
+}
+
 export async function resolveNavigationWithCache(innertube: { resolveURL: (url: string) => Promise<any> }, url: string, config: { VIDEO_CACHE_TTL_SECONDS: number; CHANNEL_CACHE_TTL_SECONDS: number; }): Promise<any> {
   const isWatch = isValidYoutubeWatchUrl(url);
   const videoTtl = config.VIDEO_CACHE_TTL_SECONDS;
   const channelTtl = config.CHANNEL_CACHE_TTL_SECONDS;
   const ttl = isWatch ? videoTtl : channelTtl;
-  const cacheKey = `yt:navigation:${isWatch ? 'watch' : 'channel'}:${url}`;
+  const cacheKey = `yt:navigation:${isWatch ? 'watch' : 'channel'}:${encodeUrl(url)}`;
 
   const cached = await redisGetJson<any>(cacheKey).catch(() => null);
   if (cached) return cached;

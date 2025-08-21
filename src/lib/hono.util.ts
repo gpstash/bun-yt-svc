@@ -51,6 +51,9 @@ export const ERROR_CODES = {
   YT_PLAYABILITY_ERROR: 'YT_PLAYABILITY_ERROR',
   YT_TRANSLATION_UNSUPPORTED: 'YT_TRANSLATION_UNSUPPORTED',
   YT_TRANSLATION_SAME_LANGUAGE: 'YT_TRANSLATION_SAME_LANGUAGE',
+  // Continuation specific
+  YT_CONTINUATION_FAILED: 'YT_CONTINUATION_FAILED',
+  YT_CONTINUATION_EXHAUSTED: 'YT_CONTINUATION_EXHAUSTED',
 
   // Generic
   INTERNAL_ERROR: 'INTERNAL_ERROR',
@@ -115,6 +118,15 @@ function detectYouTubeError(err: unknown): { status: number; code: ErrorCode; me
   // Transcript unavailable / disabled / not found
   if ((has('transcript') || has('caption')) && (has('not available') || has('unavailable') || has('disabled') || has('not found'))) {
     return { status: 404, code: ERROR_CODES.YT_TRANSCRIPT_UNAVAILABLE, message: 'Transcript unavailable' };
+  }
+  // Continuation-specific failures
+  if (has('continuation')) {
+    if (has('invalid') || has('expired') || has('not found') || has('missing') || has('failed')) {
+      return { status: 409, code: ERROR_CODES.YT_CONTINUATION_FAILED, message: 'Continuation failed' };
+    }
+    if (has('no more') || has('exhausted') || has('end of') || has('finished')) {
+      return { status: 200, code: ERROR_CODES.YT_CONTINUATION_EXHAUSTED, message: 'Continuation exhausted' };
+    }
   }
   // Our app-level validation & translation errors
   if (has('invalid language')) {

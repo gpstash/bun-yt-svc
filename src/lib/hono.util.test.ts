@@ -46,4 +46,20 @@ describe("mapErrorToHttp()", () => {
     const m2 = mapErrorToHttp(e2);
     expect([ERROR_CODES.YT_PRIVATE, ERROR_CODES.INTERNAL_ERROR]).toContain(m2.code);
   });
+
+  test("continuation failure is classified", () => {
+    const e = new Error("Continuation token expired");
+    const m = mapErrorToHttp(e);
+    expect(m.code).toBe(ERROR_CODES.YT_CONTINUATION_FAILED);
+    expect(m.status).toBe(409);
+    expect(typeof m.message).toBe("string");
+  });
+
+  test("continuation exhausted is classified", () => {
+    const e = new Error("No more continuation available");
+    const m = mapErrorToHttp(e);
+    expect(m.code).toBe(ERROR_CODES.YT_CONTINUATION_EXHAUSTED);
+    expect(m.status).toBe(200);
+    expect(typeof m.message).toBe("string");
+  });
 });

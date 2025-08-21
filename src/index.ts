@@ -16,4 +16,5 @@ void InnertubeService.ensurePlayerReady();
 export default {
   fetch: app.fetch,
   port: Number(config.APP_PORT),
+  idleTimeout: Number(config.IDLE_TIMEOUT_SECONDS),
 };

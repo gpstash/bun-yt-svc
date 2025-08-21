@@ -1,16 +1,15 @@
 import { Hono } from "hono";
+import { YTNodes } from "youtubei.js"
 import { AppSchema } from "@/app";
 import { createLogger } from "@/lib/logger.lib";
 import type { Context } from "hono";
 import { ERROR_CODES, mapErrorToHttp, isClientAbort, STATUS_CLIENT_CLOSED_REQUEST } from "@/lib/hono.util";
-import type { ErrorCode } from "@/lib/hono.util";
 import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
 import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegativeCache } from '@/lib/cache.util';
 import { upsertChannel, getChannelById } from '@/service/channel.service';
 import { z } from 'zod';
 import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
-import { buildYoutubeUrlFromId, resolveNavigationWithCache } from '@/helper/navigation.helper';
-import type { NavigationMapValue, ChannelBatchResponse } from '@/types/navigation.types';
+import type { ChannelBatchResponse } from '@/types/navigation.types';
 import { navigationBatchMiddleware } from "@/middleware/navigation-batch.middleware";
 import { navigationMiddleware } from "@/middleware/navigation.middleware";
 
@@ -105,29 +104,34 @@ async function fetchChannel(
   }
 }
 
-// Backward-compat wrapper for batch usage
-async function batchFetchOne(c: Context<AppSchema>, channelId: string) {
-  return fetchChannel(c, channelId, { serveStale: false });
+// Local helpers for this router only
+function sleep(ms: number) { return new Promise((res) => setTimeout(res, ms)); }
+function rand(min: number, max: number) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+function mapGridVideos(videos: YTNodes.GridVideo[]) {
+  return videos.map((video) => ({
+    id: video.video_id,
+    title: video.title?.text ?? '',
+  }));
 }
 
 v1InnertubeChannelRouter.get('/', navigationMiddleware(), async (c: Context<AppSchema>) => {
-  try {
-    const navigationEndpoint = c.get('navigationEndpoint');
-    const channelId = navigationEndpoint?.payload?.browseId;
-    if (!channelId) return c.json({ error: 'Channel ID not found', code: ERROR_CODES.BAD_REQUEST }, 400);
+  const requestId = c.get('requestId');
+  const navigationEndpoint = c.get('navigationEndpoint');
+  const channelId = navigationEndpoint?.payload?.browseId;
+  if (!channelId) return c.json({ error: 'Channel ID not found', code: ERROR_CODES.BAD_REQUEST }, 400);
 
+  try {
     const r = await fetchChannel(c, channelId, { serveStale: true });
     if ((r as any).__error) {
       return c.json({ error: (r as any).error, code: (r as any).code }, (r as any).__status as any);
     }
     return c.json((r as any).data);
   } catch (err) {
-    const navigationEndpoint = c.get('navigationEndpoint');
-    const channelId = navigationEndpoint?.payload?.browseId;
     const cacheKey = channelId ? `yt:channel:${channelId}` : undefined;
     const isAbort = isClientAbort(err);
     if (isAbort) {
-      logger.info('Request aborted by client', { channelId });
+      logger.info('Request aborted by client', { channelId, requestId });
       return c.json({ error: 'Client Closed Request', code: ERROR_CODES.CLIENT_CLOSED_REQUEST }, STATUS_CLIENT_CLOSED_REQUEST as any);
     }
     const mapped = mapErrorToHttp(err);
@@ -135,7 +139,109 @@ v1InnertubeChannelRouter.get('/', navigationMiddleware(), async (c: Context<AppS
       const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
       try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch { /* noop */ }
     }
-    logger.error('Error in /v1/innertube/channel', { err, mapped, channelId });
+    logger.error('Error in /v1/innertube/channel', { err, mapped, channelId, requestId });
+    return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
+  }
+});
+
+v1InnertubeChannelRouter.get('/videos', navigationMiddleware(), async (c: Context<AppSchema>) => {
+  const requestId = c.get('requestId');
+  const navigationEndpoint = c.get('navigationEndpoint');
+  const channelId = navigationEndpoint?.payload?.browseId;
+  if (!channelId) return c.json({ error: 'Channel ID not found', code: ERROR_CODES.BAD_REQUEST }, 400);
+
+  try {
+    const cfg: any = c.get('config');
+    const signal = c.get('signal') as AbortSignal | undefined;
+    const { minDelayMs, maxDelayMs } = readBatchThrottle(cfg, { maxConcurrency: 2, minDelayFloorMs: 50 });
+
+    const channel = await c.get('innertubeSvc').getInnertube().getChannel(channelId);
+    let page: any = await channel.getVideos();
+
+    const videos: { id: string; title: string; }[] = mapGridVideos(page.videos as YTNodes.GridVideo[]);
+    const seen = new Set<string>(videos.map(v => v.id));
+
+    // Track how many pages we loaded (for diagnostics)
+    let pageCount = 1;
+
+    // Loop through continuations until exhausted with retry/backoff for transient errors.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (signal?.aborted) {
+        const abortErr: any = new Error('AbortError');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
+      // Stop if no continuation is available (avoid calling getContinuation() needlessly)
+      const hasNext = Boolean((page as any)?.has_continuation ?? (page as any)?.continuation ?? (page as any)?.continuation_command);
+      if (!hasNext) {
+        logger.debug('No continuation available; stop paging', { channelId, pageCount, requestId });
+        break;
+      }
+      const delay = rand(minDelayMs, maxDelayMs);
+      logger.debug('Delaying before fetching channel videos continuation', { channelId, delay, page: pageCount + 1, requestId });
+      await sleep(delay);
+      if (signal?.aborted) {
+        const abortErr: any = new Error('AbortError');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
+
+      // Per-page retry with backoff
+      let attempt = 0;
+      const maxAttempts = 3;
+      let stopPaging = false;
+      while (true) {
+        try {
+          const nextPage: any = await page.getContinuation();
+          const contVideos = mapGridVideos(nextPage.videos as YTNodes.GridVideo[]);
+          let added = 0;
+          for (const v of contVideos) {
+            if (!seen.has(v.id)) {
+              seen.add(v.id);
+              videos.push(v);
+              added++;
+            }
+          }
+          page = nextPage;
+          pageCount++;
+          logger.debug('Continuation page loaded', { channelId, pageCount, added, attempt, requestId });
+          if (added === 0 || contVideos.length === 0) {
+            // No new items; likely exhausted -> stop outer loop
+            stopPaging = true;
+          }
+          // Try to continue outer loop
+          break;
+        } catch (e) {
+          const mapped = mapErrorToHttp(e);
+          const retriable = mapped.status === 429 || mapped.status === 408 || mapped.status >= 500;
+          if (retriable && attempt < maxAttempts - 1 && !signal?.aborted) {
+            attempt++;
+            const backoff = Math.min(maxDelayMs * 2 ** attempt, maxDelayMs * 8);
+            const jitter = rand(minDelayMs, backoff);
+            logger.warn('Retrying continuation fetch with backoff', { channelId, attempt, jitter, status: mapped.status, requestId });
+            await sleep(jitter);
+            continue;
+          }
+          logger.warn('Failed fetching channel videos continuation; stop paging', { channelId, attempt, mapped, pageCount, requestId });
+          // Non-retriable failure -> stop outer loop
+          stopPaging = true;
+          break;
+        }
+      }
+
+      if (stopPaging) {
+        break;
+      }
+    }
+
+    return c.json({
+      videos,
+      total: videos.length,
+    });
+  } catch (err) {
+    const mapped = mapErrorToHttp(err);
+    logger.error('Error in /v1/innertube/channel/videos', { err, mapped, channelId, requestId });
     return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
   }
 });
@@ -200,7 +306,7 @@ v1InnertubeChannelRouter.post('/batch', navigationBatchMiddleware(), async (c: C
           return;
         }
 
-        const r = await batchFetchOne(c, channelId);
+        const r = await fetchChannel(c, channelId, { serveStale: false });
         if ((r as any).__error) {
           results[id] = { error: (r as any).error, code: (r as any).code };
         } else {

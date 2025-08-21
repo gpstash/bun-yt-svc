@@ -37,7 +37,7 @@ export function navigationMiddleware(): MiddlewareHandler<AppSchema> {
           url,
           c.get('config')
         );
-        logger.debug('Resolved URL', { requestId });
+        logger.debug('Resolved URL', { navigationEndpoint, requestId });
         c.set('navigationEndpoint', navigationEndpoint as any);
       } catch (err) {
         const mapped = mapErrorToHttp(err);
