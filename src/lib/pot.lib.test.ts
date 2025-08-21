@@ -1,10 +1,11 @@
 import { describe, expect, test, mock, afterEach, jest } from "bun:test";
 
 // Silence logger
-mock.module("@/lib/logger.lib", () => ({ createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }) }));
+mock.module("@/lib/logger.lib", () => ({ __esModule: true, createLogger: () => ({ debug() {}, info() {}, warn() {}, error() {} }) }));
 
 // Mock jsdom to provide window/document
 mock.module("jsdom", () => ({
+  __esModule: true,
   JSDOM: class {
     window: any;
     constructor(_html: string, _opts: any) {
@@ -20,6 +21,7 @@ mock.module("jsdom", () => ({
 
 // Mock bgutils-js
 mock.module("bgutils-js", () => ({
+  __esModule: true,
   USER_AGENT: "ua",
   GOOG_API_KEY: "key",
   buildURL: (name: string, _bool: boolean) => `https://example.com/${name}`,
@@ -38,6 +40,7 @@ mock.module("bgutils-js", () => ({
 
 // Mock http.lib to serve interpreter js and GenerateIT response
 mock.module("@/lib/http.lib", () => ({
+  __esModule: true,
   http: async (url: string, _init?: any, _opts?: any) => {
     if (String(url).includes("interp.js")) return new Response("console.log('interp')", { status: 200 });
     if (String(url).includes("GenerateIT")) return new Response(JSON.stringify(["integrityToken123"]), { status: 200, headers: { "content-type": "application/json" } });

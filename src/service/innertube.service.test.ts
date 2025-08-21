@@ -2,6 +2,7 @@ import { beforeEach, afterEach, describe, expect, it, mock, jest } from "bun:tes
 
 // Mocks must be registered before importing the module under test
 mock.module("@/lib/logger.lib", () => ({
+  __esModule: true,
   createLogger: () => ({
     debug: jest.fn(),
     info: jest.fn(),
