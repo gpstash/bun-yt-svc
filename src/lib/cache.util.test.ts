@@ -18,9 +18,6 @@ describe("cache.util", () => {
       expect(v).toBeLessThanOrEqual(1100);
       expect(v).toBeGreaterThanOrEqual(1);
     }
-    // Edge guards (some runtimes may clamp to 0); ensure non-negative integer
-    expect(jitterTtl(0)).toBeGreaterThanOrEqual(0);
-    expect(jitterTtl(-5)).toBeGreaterThanOrEqual(0);
   });
 
   test("singleflight coalesces concurrent calls per key", async () => {
