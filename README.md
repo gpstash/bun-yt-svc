@@ -1,5 +1,7 @@
 # bun-yt-svc
 
+[![CI](https://github.com/gpstash/bun-yt-svc/actions/workflows/ci.yml/badge.svg)](https://github.com/gpstash/bun-yt-svc/actions/workflows/ci.yml)
+
 Tiny Bun/Hono service that exposes selected YouTube Innertube capabilities via a clean HTTP API.
 
 It uses `youtubei.js` under the hood and adds:
@@ -259,6 +261,18 @@ Multi-stage Dockerfile builds and runs the bundled server for faster cold start.
 docker build -t bun-yt-svc .
 docker run -p 1331:1331 --env APP_PORT=1331 bun-yt-svc
 ```
+
+## Testing
+
+Run unit tests locally with Bun:
+
+```sh
+bun test
+# or run a single test file
+bun test src/service/innertube.service.test.ts
+```
+
+CI runs on GitHub Actions via `.github/workflows/ci.yml` on push/PR to `main`/`master` and executes install, tests, and a sanity build.
 
 
 ## Deploy (Fly.io Machines)
