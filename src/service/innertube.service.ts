@@ -2,7 +2,7 @@ import { createLogger } from "@/lib/logger.lib";
 import { mapErrorToHttp } from "@/lib/hono.util";
 import { redisGetJson, redisSetJson } from "@/lib/redis.lib";
 import { jitterTtl, singleflight, fetchWithRedisLock } from "@/lib/cache.util";
-import { ClientType, Innertube, Log, UniversalCache, YT, YTNodes } from "youtubei.js";
+import { ClientType, Innertube, UniversalCache, YT, YTNodes } from "youtubei.js";
 import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedVideoInfoWithTranscript, finCaptionByLanguageCode, ParsedVideoInfoWithCaption } from "@/helper/video.helper";
 import { decodeJson3Caption, buildParsedVideoInfoWithCaption } from "@/helper/caption.helper";
 import { http, HttpOptions } from "@/lib/http.lib";
@@ -422,7 +422,9 @@ export class InnertubeService {
         const pl = await this.innertube.getPlaylist(playlistId);
         let page = pl;
 
-        const items: ChannelVideo[] = Array.isArray(page?.videos) ? this.mapPlaylistVideos(page.items) : [];
+        const items: ChannelVideo[] = Array.isArray(page?.videos)
+          ? this.mapPlaylistVideos(page.videos as unknown as YTNodes.PlaylistVideo[])
+          : [];
         const seen = new Set<string>(items.map(v => v.id).filter(Boolean));
         if (items.length >= limit) return items.slice(0, limit);
 
@@ -445,7 +447,9 @@ export class InnertubeService {
 
           try {
             const next = await page.getContinuation() as YT.Playlist;
-            const nextVideos: any[] = Array.isArray(next?.videos) ? next.videos : [];
+            const nextVideos: YTNodes.PlaylistVideo[] = Array.isArray(next?.videos)
+              ? (next.videos as unknown as YTNodes.PlaylistVideo[])
+              : [];
             const mapped = this.mapPlaylistVideos(nextVideos);
             let added = 0;
             for (const v of mapped) {
@@ -770,6 +774,7 @@ export class InnertubeService {
 
   private static async tryWebEmbeddedBypassBestEffort(webInnertube: Innertube, info: YT.VideoInfo, id: string, po: string): Promise<{ updated: boolean; clientName?: string; hasTrailer: boolean; trailerIsAgeRestricted: boolean; } | undefined> {
     try {
+      const { ClientType } = await import('youtubei.js');
       const webEmbeddedInnertube = await InnertubeService.createInnertube({ clientType: ClientType.WEB_EMBEDDED });
       webEmbeddedInnertube.session.context.client.visitorData = webInnertube.session.context.client.visitorData;
 
@@ -1056,6 +1061,7 @@ export class InnertubeService {
   }
 
   public static async createInnertube(opts?: CreateInnertubeOptions): Promise<Innertube> {
+    const { Innertube, Log, UniversalCache } = await import('youtubei.js');
     Log.setLevel(Log.Level.INFO);
     const { withPlayer, location, safetyMode, clientType, generateSessionLocally } = {
       withPlayer: false,
