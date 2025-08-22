@@ -1,5 +1,7 @@
 import { createLogger } from "@/lib/logger.lib";
 import { mapErrorToHttp } from "@/lib/hono.util";
+import { redisGetJson, redisSetJson } from "@/lib/redis.lib";
+import { jitterTtl, singleflight, fetchWithRedisLock } from "@/lib/cache.util";
 import { ClientType, Innertube, Log, UniversalCache, YT, YTNodes } from "youtubei.js";
 import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedVideoInfoWithTranscript, finCaptionByLanguageCode, ParsedVideoInfoWithCaption } from "@/helper/video.helper";
 import { decodeJson3Caption, buildParsedVideoInfoWithCaption } from "@/helper/caption.helper";
@@ -275,7 +277,19 @@ export class InnertubeService {
       title: v?.title?.text ?? '',
       duration: v?.length_text?.text ?? '0:00',
       published: v?.published?.text ?? '',
-      viewCount: v?.short_view_count?.text ?? '',
+      viewCount: v?.view_count?.text ?? '',
+    }));
+  }
+
+  // Normalize playlist video node shape to ChannelVideo (aligned with mapChannelVideos)
+  private mapPlaylistVideos(arr: YTNodes.PlaylistVideo[]): ChannelVideo[] {
+    return arr.map((v: YTNodes.PlaylistVideo) => ({
+      id: v?.id ?? '',
+      type: v?.type ?? '',
+      title: v?.title?.text ?? '',
+      duration: v?.duration?.text ?? '0:00',
+      published: v?.video_info?.runs?.[2]?.text ?? '',
+      viewCount: v?.video_info?.runs?.[0]?.text ?? '',
     }));
   }
 
@@ -380,6 +394,143 @@ export class InnertubeService {
       const total = Math.min(videos.length, limit);
       logger.info('getChannelVideos:done', { channelId, total, pages: pageCount, limit, requestId: ctx?.requestId });
       return videos.slice(0, limit);
+    });
+  }
+
+  private static buildPlaylistVideosCacheKey(playlistId: string) {
+    return `yt:playlist:${playlistId}:videos`;
+  }
+
+  /**
+   * Fetch playlist videos with caching, continuation handling and de-duplication.
+   * Normalizes items to the same shape as channel videos.
+   */
+  public async getPlaylistVideos(
+    playlistId: string,
+    opts?: RequestOptions & { minDelayMs?: number; maxDelayMs?: number; limit?: number; ttlSeconds?: number }
+  ): Promise<ChannelVideo[]> {
+    const minDelayMs = Math.max(0, opts?.minDelayMs ?? 50);
+    const maxDelayMs = Math.max(minDelayMs, opts?.maxDelayMs ?? 150);
+    const limit = Math.max(30, Math.min(5000, Math.floor(opts?.limit ?? 5000)));
+    const ttlSeconds = Math.max(30, Math.floor(opts?.ttlSeconds ?? 600));
+
+    return await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
+      const ctx = InnertubeService.requestContext.getStore();
+      const key = InnertubeService.buildPlaylistVideosCacheKey(playlistId);
+      const now = Date.now();
+
+      type CacheShape = {
+        items: ChannelVideo[];
+        firstId: string | null;
+        updatedAt: number;
+        staleAt: number;
+        ttlSeconds: number;
+      };
+
+      const fetchAll = async (): Promise<ChannelVideo[]> => {
+        const pl = await this.innertube.getPlaylist(playlistId);
+        let page = pl;
+
+        const items: ChannelVideo[] = Array.isArray(page?.videos) ? this.mapPlaylistVideos(page.items) : [];
+        const seen = new Set<string>(items.map(v => v.id).filter(Boolean));
+        if (items.length >= limit) return items.slice(0, limit);
+
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          if (opts?.signal?.aborted) {
+            const abortErr: any = new Error('AbortError');
+            abortErr.name = 'AbortError';
+            throw abortErr;
+          }
+          if (!page?.has_continuation) break;
+
+          const delay = Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1)) + minDelayMs;
+          await new Promise((res) => setTimeout(res, delay));
+          if (opts?.signal?.aborted) {
+            const abortErr: any = new Error('AbortError');
+            abortErr.name = 'AbortError';
+            throw abortErr;
+          }
+
+          try {
+            const next = await page.getContinuation() as YT.Playlist;
+            const nextVideos: any[] = Array.isArray(next?.videos) ? next.videos : [];
+            const mapped = this.mapPlaylistVideos(nextVideos);
+            let added = 0;
+            for (const v of mapped) {
+              if (v.id && !seen.has(v.id)) {
+                seen.add(v.id);
+                items.push(v);
+                added++;
+                if (items.length >= limit) break;
+              }
+            }
+            page = next;
+            if (items.length >= limit || added === 0 || nextVideos.length === 0) break;
+          } catch (e) {
+            const mapped = mapErrorToHttp(e);
+            logger.warn('getPlaylistVideos:failed-continuation', { playlistId, mapped, requestId: ctx?.requestId });
+            break;
+          }
+        }
+
+        return items.slice(0, limit);
+      };
+
+      const result = await singleflight(key, async () => {
+        const cached = await redisGetJson<CacheShape>(key).catch(() => null);
+        if (cached && Array.isArray(cached.items)) {
+          if (now < cached.staleAt) {
+            logger.info('Playlist videos cache hit (fresh)', { playlistId, count: cached.items.length, requestId: ctx?.requestId });
+            return cached;
+          }
+          // Revalidate: fetch first page and compare
+          logger.info('Playlist videos cache stale; checking first page', { playlistId, count: cached.items.length, requestId: ctx?.requestId });
+          const first = await this.innertube.getPlaylist(playlistId);
+          const firstId = (first as any)?.videos?.[0]?.id || (first as any)?.videos?.[0]?.video_id || null;
+          if (firstId && firstId === cached.firstId) {
+            const extended: CacheShape = {
+              ...cached,
+              updatedAt: now,
+              staleAt: now + ttlSeconds * 1000,
+              ttlSeconds,
+            };
+            try { await redisSetJson(key, extended, jitterTtl(Math.max(ttlSeconds * 30, ttlSeconds + 1))); } catch { /* noop */ }
+            logger.info('Playlist videos cache extended (no changes upstream)', { playlistId, requestId: ctx?.requestId });
+            return extended;
+          }
+          // Upstream changed
+          const videos = await fetchAll();
+          const next: CacheShape = {
+            items: videos,
+            firstId: videos[0]?.id ?? null,
+            updatedAt: now,
+            staleAt: now + ttlSeconds * 1000,
+            ttlSeconds,
+          };
+          try { await redisSetJson(key, next, jitterTtl(Math.max(ttlSeconds * 30, ttlSeconds + 1))); } catch { /* noop */ }
+          logger.info('Playlist videos cache updated (new video detected)', { playlistId, total: videos.length, requestId: ctx?.requestId });
+          return next;
+        }
+
+        // Cache miss
+        const payload = await fetchWithRedisLock(key, ttlSeconds, async () => {
+          const fetched = await fetchAll();
+          const p: CacheShape = {
+            items: fetched,
+            firstId: fetched[0]?.id ?? null,
+            updatedAt: now,
+            staleAt: now + ttlSeconds * 1000,
+            ttlSeconds,
+          };
+          try { await redisSetJson(key, p, jitterTtl(Math.max(ttlSeconds * 30, ttlSeconds + 1))); } catch { /* noop */ }
+          logger.info('Playlist videos cache populated (miss)', { playlistId, total: fetched.length, requestId: ctx?.requestId });
+          return p;
+        }, 4000);
+        return payload;
+      });
+
+      return result.items;
     });
   }
 

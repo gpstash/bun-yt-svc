@@ -5,7 +5,9 @@
     "build": "bun build --target=bun --minify --sourcemap --outdir=dist --external=canvas src/index.ts",
     "start": "bun run dist/index.js",
     "drizzle:generate": "bunx drizzle-kit generate",
-    "drizzle:migrate": "bunx drizzle-kit migrate"
+    "drizzle:migrate": "bunx drizzle-kit migrate",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage"
   },
   "dependencies": {
     "bgutils-js": "^3.2.0",

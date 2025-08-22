@@ -6,7 +6,7 @@ import { ERROR_CODES, STATUS_CLIENT_CLOSED_REQUEST, isClientAbort, mapErrorToHtt
 import { redisGetJson, redisSetJson } from "@/lib/redis.lib";
 import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegativeCache } from "@/lib/cache.util";
 import { navigationMiddleware } from "@/middleware/navigation.middleware";
-import type { ChannelVideo } from "@/service/innertube.service";
+import { InnertubeService, type ChannelVideo } from "@/service/innertube.service";
 import { readBatchThrottle } from "@/lib/throttle.util";
 import { getPlaylistById, upsertPlaylist, type PlaylistInfo } from "@/service/playlist.service";
 
@@ -173,78 +173,15 @@ v1InnertubePlaylistRouter.get('/videos', navigationMiddleware(), async (c: Conte
   const playlistId = uploadsFromChannel ?? resolvedPlaylistId ?? extractPlaylistId(rawId ?? '');
   if (!playlistId) return c.json({ error: 'Playlist ID not found', code: ERROR_CODES.BAD_REQUEST }, 400);
 
-  type CacheShape = {
-    items: ChannelVideo[];
-    firstId: string | null;
-    updatedAt: number;
-    staleAt: number;
-    ttlSeconds: number;
-  };
-
   try {
     const cfg: any = c.get('config');
     const signal = c.get('signal') as AbortSignal | undefined;
     const { minDelayMs, maxDelayMs } = readBatchThrottle(cfg, { maxConcurrency: 2, minDelayFloorMs: 50 });
     const ttlSeconds = cfg.CHANNEL_CACHE_TTL_SECONDS as number; // reuse channel ttl policy
 
-    const key = buildVideosCacheKey(playlistId);
-
-    const result = await singleflight(key, async () => {
-      const now = Date.now();
-      const cached = await redisGetJson<CacheShape>(key).catch(() => null);
-      if (cached && Array.isArray(cached.items)) {
-        if (now < cached.staleAt) {
-          logger.info('Playlist videos cache hit (fresh)', { playlistId, count: cached.items.length, requestId });
-          return cached;
-        }
-        // Freshness check: re-fetch first page and compare first video id
-        logger.info('Playlist videos cache stale; checking first page', { playlistId, count: cached.items.length, requestId });
-        const inn = c.get('innertubeSvc').getInnertube();
-        const first = await inn.getPlaylist(playlistId);
-        const firstId = (first as any)?.videos?.[0]?.id || (first as any)?.videos?.[0]?.video_id || null;
-        if (firstId && firstId === cached.firstId) {
-          const extended: CacheShape = {
-            ...cached,
-            updatedAt: now,
-            staleAt: now + ttlSeconds * 1000,
-            ttlSeconds,
-          };
-          try { await redisSetJson(key, extended, jitterTtl(Math.max(ttlSeconds * 30, ttlSeconds + 1))); } catch { /* noop */ }
-          logger.info('Playlist videos cache extended (no changes upstream)', { playlistId, requestId });
-          return extended;
-        }
-        // Change detected -> fetch all pages
-        const videos = await fetchAllPlaylistVideos(c, playlistId, { signal, requestId, minDelayMs, maxDelayMs });
-        const next: CacheShape = {
-          items: videos,
-          firstId: videos[0]?.id ?? null,
-          updatedAt: now,
-          staleAt: now + ttlSeconds * 1000,
-          ttlSeconds,
-        };
-        try { await redisSetJson(key, next, jitterTtl(Math.max(ttlSeconds * 30, ttlSeconds + 1))); } catch { /* noop */ }
-        logger.info('Playlist videos cache updated (new video detected)', { playlistId, total: videos.length, requestId });
-        return next;
-      }
-
-      // Miss -> fetch all pages and set
-      const videos = await fetchWithRedisLock(key, ttlSeconds, async () => {
-        const fetched = await fetchAllPlaylistVideos(c, playlistId, { signal, requestId, minDelayMs, maxDelayMs });
-        const payload: CacheShape = {
-          items: fetched,
-          firstId: fetched[0]?.id ?? null,
-          updatedAt: now,
-          staleAt: now + ttlSeconds * 1000,
-          ttlSeconds,
-        };
-        try { await redisSetJson(key, payload, jitterTtl(Math.max(ttlSeconds * 30, ttlSeconds + 1))); } catch { /* noop */ }
-        logger.info('Playlist videos cache populated (miss)', { playlistId, total: fetched.length, requestId });
-        return payload;
-      }, 4000);
-      return videos;
-    });
-
-    return c.json(result.items);
+    const innSvc = c.get('innertubeSvc') as InnertubeService;
+    const items = await innSvc.getPlaylistVideos(playlistId, { signal, requestId, minDelayMs, maxDelayMs, limit: 5000, ttlSeconds });
+    return c.json(items);
   } catch (err) {
     const mapped = mapErrorToHttp(err);
     logger.error('Error in /v1/innertube/playlist/videos', { err, mapped, playlistId, requestId });
@@ -252,66 +189,4 @@ v1InnertubePlaylistRouter.get('/videos', navigationMiddleware(), async (c: Conte
   }
 });
 
-// Helper to map raw youtubei.js Playlist video nodes to ChannelVideo shape
-async function fetchAllPlaylistVideos(
-  c: Context<AppSchema>,
-  playlistId: string,
-  opts?: { signal?: AbortSignal; requestId?: string; minDelayMs?: number; maxDelayMs?: number; limit?: number }
-): Promise<ChannelVideo[]> {
-  const inn = c.get('innertubeSvc').getInnertube();
-  const minDelayMs = Math.max(0, opts?.minDelayMs ?? 50);
-  const maxDelayMs = Math.max(minDelayMs, opts?.maxDelayMs ?? 150);
-  const limit = Math.max(30, Math.min(5000, Math.floor(opts?.limit ?? 5000)));
-
-  const pl: any = await inn.getPlaylist(playlistId);
-  let page: any = pl;
-
-  const mapVideo = (v: any): ChannelVideo => ({
-    id: v?.id || v?.video_id || '',
-    type: v?.type || 'Video',
-    title: v?.title?.toString?.() ?? v?.title ?? '',
-    duration: v?.duration?.toString?.() ?? v?.length_text?.text ?? '0:00',
-    published: v?.published?.text ?? v?.published ?? '',
-    viewCount: v?.short_view_count?.text ?? v?.view_count ?? '',
-  });
-
-  const items: ChannelVideo[] = Array.isArray(page?.videos) ? page.videos.map(mapVideo) : [];
-  const seen = new Set<string>(items.map(v => v.id).filter(Boolean));
-  if (items.length >= limit) return items.slice(0, limit);
-
-  // Iterate continuations
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    if (opts?.signal?.aborted) {
-      const e: any = new Error('AbortError'); e.name = 'AbortError'; throw e;
-    }
-    if (!page?.has_continuation) break;
-
-    const delay = Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1)) + minDelayMs;
-    await new Promise((res) => setTimeout(res, delay));
-    if (opts?.signal?.aborted) { const e: any = new Error('AbortError'); e.name = 'AbortError'; throw e; }
-
-    try {
-      const next = await page.getContinuation();
-      const nextVideos: any[] = Array.isArray(next?.videos) ? next.videos : [];
-      let added = 0;
-      for (const v of nextVideos.map(mapVideo)) {
-        if (v.id && !seen.has(v.id)) {
-          seen.add(v.id);
-          items.push(v);
-          added++;
-          if (items.length >= limit) break;
-        }
-      }
-      page = next;
-      if (items.length >= limit || added === 0 || nextVideos.length === 0) break;
-    } catch (e) {
-      // Log and stop on continuation failure
-      const mapped = mapErrorToHttp(e);
-      logger.warn('fetchAllPlaylistVideos:failed-continuation', { playlistId, mapped, requestId: opts?.requestId });
-      break;
-    }
-  }
-
-  return items.slice(0, limit);
-}
+// Helper removed: moved into InnertubeService.getPlaylistVideos

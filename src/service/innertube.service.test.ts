@@ -17,6 +17,19 @@ suiteBeforeAll(() => {
     },
     ...(() => { let level = "info" as any; return { getLogLevel: () => level, setLogLevel: (l: any) => { level = String(l).toLowerCase(); } }; })(),
   }));
+  // Simple in-memory redis/cache stubs for playlist tests
+  const mem = new Map<string, any>();
+  mock.module("@/lib/redis.lib", () => ({
+    __esModule: true,
+    redisGetJson: async (key: string) => mem.get(key),
+    redisSetJson: async (key: string, val: any, _ttl?: number) => { mem.set(key, val); },
+  }));
+  mock.module("@/lib/cache.util", () => ({
+    __esModule: true,
+    jitterTtl: (n: number) => n,
+    singleflight: async (_key: string, fn: () => Promise<any>) => fn(),
+    fetchWithRedisLock: async (_key: string, _ttl: number, fn: () => Promise<any>) => fn(),
+  }));
 });
 
 describe("InnertubeService.getChannelVideos", () => {
