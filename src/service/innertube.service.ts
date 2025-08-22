@@ -926,9 +926,13 @@ export class InnertubeService {
     const ctx = InnertubeService.requestContext.getStore();
 
     let writableInit: RequestInit | undefined = mergedInit ? { ...mergedInit } : undefined;
+
+    // -- Disabled due to failed to resolve videoId --
+    /*
     if (isPlayerEndpoint && writableInit?.body && typeof writableInit.body === 'string') {
       writableInit.body = (writableInit.body as string).replace('"videoId":', '"params":"8AEB","videoId":')
     }
+    */
 
     // If this is a player asset (JS), serve from in-memory cache or coalesce concurrent fetches
     if (isPlayerAsset && (mergedInit?.method ?? 'GET').toUpperCase() === 'GET') {
@@ -1092,7 +1096,7 @@ export class InnertubeService {
       cache,
       generate_session_locally: !!generateSessionLocally,
       // Ensure all network requests go through our resilient HTTP client
-      fetch: fetchWithPreconnect
+      fetch: fetchWithPreconnect,
     }
 
     logger.debug('[createInnertube] Creating Innertube instance with config:', innertubeConfig);

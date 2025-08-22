@@ -5,8 +5,7 @@ import type { AppSchema } from '@/app';
 import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODES } from '@/lib/hono.util';
 import { z } from 'zod';
 import { upsertVideo, getVideoById } from '@/service/video.service';
-import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
-import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegativeCache } from '@/lib/cache.util';
+import { jitterTtl, swrResolve } from '@/lib/cache.util';
 import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
 import { navigationMiddleware } from '@/middleware/navigation.middleware';
 import { navigationBatchMiddleware } from '@/middleware/navigation-batch.middleware';
@@ -24,105 +23,35 @@ function getTtlSeconds(c: Context<AppSchema>) {
   return c.get('config').VIDEO_CACHE_TTL_SECONDS as number;
 }
 
-function computeFreshness(updatedAt: Date | string, ttlSeconds: number) {
-  const updatedAtMs = new Date(updatedAt).getTime();
-  const ageSeconds = Math.max(0, Math.floor((Date.now() - updatedAtMs) / 1000));
-  const isFresh = ageSeconds < ttlSeconds;
-  const remaining = isFresh ? Math.max(1, ttlSeconds - ageSeconds) : 0;
-  return { isFresh, remaining, ageSeconds };
-}
-
-async function warmCache(cacheKey: string, data: any, ttl: number, logCtx: Record<string, any>) {
-  try {
-    await redisSetJson(cacheKey, data, jitterTtl(ttl));
-    logger.debug('Video cached from DB', logCtx);
-  } catch (cacheErr) {
-    logger.error('Video caching from DB failed', { ...logCtx, error: cacheErr });
-  }
-}
-
-async function negativeCacheIfBadRequest(cacheKey: string, mapped: ReturnType<typeof mapErrorToHttp>, logCtx: Record<string, any>) {
-  if (mapped.status >= 400 && mapped.status < 500 && mapped.code === ERROR_CODES.BAD_REQUEST) {
-    const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-    try {
-      await redisSetJson(cacheKey, neg, jitterTtl(60));
-      logger.debug('Negative-cache set for video', { ...logCtx, status: mapped.status, code: mapped.code });
-    } catch {/* noop */ }
-  }
-}
-
 type ResolveOptions = { swrOnStale?: boolean };
 
-// Unified resolver: cache -> DB (fresh? serve, warm) -> if stale: SWR or fetch -> persist -> cache
+// Unified resolver via shared SWR helper
 async function resolveVideo(c: Context<AppSchema>, videoId: string, opts: ResolveOptions = {}) {
   const requestId = c.get('requestId');
   const ttlSeconds = getTtlSeconds(c);
   const cacheKey = buildCacheKey(videoId);
 
-  // 1) Cache
-  const cached = await redisGetJson<any>(cacheKey).catch(() => undefined);
-  if (cached) {
-    logger.info('Cache hit for video', { videoId, requestId });
-    if (isNegativeCache(cached)) {
-      return { __error: true, error: cached.error, code: cached.code, __status: (cached as any).__status ?? 400 };
-    }
-    return { data: cached };
-  }
-  logger.debug('Cache miss for video', { videoId, requestId, cacheKey });
-
-  // 2) DB
-  try {
-    const dbRes = await getVideoById(videoId);
-    if (dbRes) {
-      const { isFresh, remaining, ageSeconds } = computeFreshness(dbRes.updatedAt, ttlSeconds);
-      if (isFresh) {
-        await warmCache(cacheKey, dbRes.video, remaining, { videoId, remaining, requestId });
-        logger.info('DB hit within TTL for video', { videoId, ageSeconds, remaining, requestId });
-        return { data: dbRes.video };
-      }
-      logger.info('DB hit but stale for video', { videoId, ageSeconds, ttlSeconds, requestId });
-
-      // SWR: return stale and refresh in background
-      if (opts.swrOnStale) {
-        const stale = dbRes.video;
-        void (async () => {
-          try {
-            await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
-              const r = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
-              try { await upsertVideo(r); } catch {/* noop */ }
-              try { await redisSetJson(cacheKey, r, jitterTtl(ttlSeconds)); } catch {/* noop */ }
-              return r;
-            });
-          } catch (e) {
-            const mapped = mapErrorToHttp(e);
-            await negativeCacheIfBadRequest(cacheKey, mapped, { videoId, requestId });
-          }
-        })();
-        return { data: stale };
-      }
-      // Else fallthrough to fetch
-    }
-  } catch (dbErr) {
-    logger.error('DB check failed; will continue to fetch', { videoId, requestId, error: dbErr });
-  }
-
-  // 3) Fetch -> persist -> cache (singleflight + distributed lock)
-  try {
-    logger.info('Fetching video from upstream', { videoId, requestId });
-    const info = await singleflight(cacheKey, async () => {
-      return await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
-        const r = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
-        try { await upsertVideo(r); } catch {/* noop */ }
-        try { await redisSetJson(cacheKey, r, jitterTtl(ttlSeconds)); } catch {/* noop */ }
-        return r;
-      });
-    });
-    return { data: info };
-  } catch (e) {
-    const mapped = mapErrorToHttp(e);
-    await negativeCacheIfBadRequest(cacheKey, mapped, { videoId, requestId });
-    return { __error: true, error: mapped.message || 'Internal Server Error', code: mapped.code, __status: mapped.status };
-  }
+  const result = await swrResolve<any, { video: any; updatedAt: Date | string }>({
+    cacheKey,
+    ttlSeconds,
+    serveStale: !!opts.swrOnStale,
+    getFromDb: async () => {
+      try { return await getVideoById(videoId) as any; } catch { return null; }
+    },
+    dbUpdatedAt: (db) => db.updatedAt,
+    assembleFromDb: async (db, remaining) => {
+      logger.info('DB hit within TTL for video', { videoId, remaining, requestId });
+      return db.video;
+    },
+    fetchPersist: async () => {
+      logger.info('Fetching video from upstream', { videoId, requestId });
+      const r = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
+      try { await upsertVideo(r); } catch {/* noop */ }
+      return r;
+    },
+    shouldNegativeCache: (status, code) => status >= 400 && status < 500 && code === ERROR_CODES.BAD_REQUEST,
+  });
+  return result as any;
 }
 
 v1InnertubeVideoRouter.get('/', navigationMiddleware(), async (c: Context<AppSchema>) => {

@@ -6,7 +6,7 @@ import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODE
 import type { ErrorCode } from '@/lib/hono.util';
 import { z } from 'zod';
 import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
-import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegativeCache } from '@/lib/cache.util';
+import { swrResolve } from '@/lib/cache.util';
 import { getTranscriptByVideoAndLanguage, upsertTranscript, getPreferredTranscriptLanguage, hasTranscriptLanguage } from '@/service/transcript.service';
 import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
 import { getVideoById, upsertVideo } from '@/service/video.service';
@@ -24,42 +24,6 @@ const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode>([
   ERROR_CODES.YT_TRANSLATION_UNSUPPORTED,
   ERROR_CODES.YT_TRANSLATION_SAME_LANGUAGE,
 ]);
-
-function shouldNegativeCache(status: number, code: ErrorCode): boolean {
-  return status >= 400 && status < 500 && LANG_RELATED_CODES.has(code);
-}
-
-async function getCachedJson<T>(key: string): Promise<T | undefined> {
-  try {
-    const val = await redisGetJson<T>(key);
-    return (val as any) ?? undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function computeAgeSeconds(updatedAt: Date): number {
-  const now = Date.now();
-  const updatedAtMs = new Date(updatedAt).getTime();
-  return Math.max(0, Math.floor((now - updatedAtMs) / 1000));
-}
-
-async function setAliasIfNoRequested(videoId: string, requestedLang: string | undefined | null, languageToSet: string, ttlSeconds: number) {
-  if (!requestedLang) {
-    try { await setAlias(videoId, languageToSet, ttlSeconds); }
-    catch { /* noop */ }
-  }
-}
-
-async function negativeCacheIfLanguageRelated(cacheKey: string, mapped: { status: number; code: ErrorCode; message?: string }, requestId?: string, logPrefix: string = 'transcript') {
-  if (shouldNegativeCache(mapped.status, mapped.code)) {
-    const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-    try {
-      await redisSetJson(cacheKey, neg, jitterTtl(60));
-      logger.debug(`${logPrefix} negative-cache set`, { cacheKey, status: mapped.status, code: mapped.code, requestId });
-    } catch { /* noop */ }
-  }
-}
 
 function buildCacheKey(videoId: string, language: string | undefined | null): string {
   const cacheLang = language ?? 'default';
@@ -117,124 +81,6 @@ async function resolveEffectiveLanguage(videoId: string, requestedLang: string |
   return { effectiveLang: '', source: 'default' };
 }
 
-async function assembleFromDbAndCache(c: Context<AppSchema>, videoId: string, dbRes: { language: string; segments: Array<{ text: string }>; updatedAt: Date; }, remainingTtl: number, requestId?: string) {
-  const ttlSeconds = Math.max(1, remainingTtl);
-  let videoDb = await getVideoById(videoId);
-  if (!videoDb) {
-    try {
-      const videoInfo = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
-      videoDb = { video: videoInfo, updatedAt: new Date() } as any;
-    } catch (videoErr) {
-      logger.error('Failed to get video info while assembling transcript response', { videoId, requestId, error: videoErr });
-    }
-  }
-  const textFromSegments = (dbRes.segments || []).map(s => s.text).join(' ').trim();
-
-  const assembled = videoDb ? {
-    ...videoDb.video,
-    transcript: {
-      language: dbRes.language,
-      segments: dbRes.segments,
-      text: textFromSegments,
-    },
-  } : {
-    id: videoId,
-    transcript: {
-      language: dbRes.language,
-      segments: dbRes.segments,
-      text: textFromSegments,
-    }
-  } as any;
-
-  const cacheKey = buildCacheKey(videoId, dbRes.language);
-  try {
-    await redisSetJson(cacheKey, assembled, jitterTtl(ttlSeconds));
-    logger.debug('Transcript cached from DB', { videoId, language: dbRes.language, remaining: ttlSeconds, requestId });
-  } catch (cacheErrDb) {
-    logger.error('Transcript caching from DB failed', { videoId, language: dbRes.language, requestId, error: cacheErrDb });
-  }
-  return assembled;
-}
-
-async function fetchPersistAndCache(c: Context<AppSchema>, videoId: string, effectiveLang: string | undefined | null, ttlSeconds: number, requestId?: string) {
-  logger.info('Cache miss for transcript, fetching from YouTube', { videoId, language: effectiveLang, requestId });
-  const info = await c.get('innertubeSvc').getTranscript(videoId, effectiveLang ?? undefined, { signal: c.get('signal'), requestId });
-  const resolvedLang = info?.transcript?.language ?? effectiveLang ?? 'default';
-
-  // Ensure parent video row exists to satisfy FK
-  try {
-    const vres = await upsertVideo(info as any);
-    logger.debug('Video upsert completed prior to transcript', { videoId, upserted: vres.upserted, requestId });
-  } catch (videoPersistErr) {
-    logger.error('Video upsert failed prior to transcript', { videoId, requestId, error: videoPersistErr });
-  }
-
-  try {
-    const res = await upsertTranscript(videoId, resolvedLang, { segments: info.transcript.segments });
-    logger.info('Transcript upsert completed', { videoId, language: resolvedLang, upserted: res.upserted, requestId });
-  } catch (persistErr) {
-    logger.error('Transcript upsert failed', { videoId, language: resolvedLang, requestId, error: persistErr });
-  }
-
-  try {
-    const cacheKeyResolved = buildCacheKey(videoId, resolvedLang);
-    await redisSetJson(cacheKeyResolved, info, ttlSeconds);
-    return { info, resolvedLang } as const;
-  } catch (cacheErr) {
-    logger.error('Transcript caching failed', { videoId, language: resolvedLang, requestId, error: cacheErr });
-    return { info, resolvedLang } as const;
-  }
-}
-
-// Encapsulate DB read and optional SWR refresh
-async function tryServeFromDb(
-  c: Context<AppSchema>,
-  videoId: string,
-  effectiveLang: string | undefined | null,
-  requestedLang: string | undefined | null,
-  ttlSeconds: number,
-  requestId: string | undefined,
-  cacheKey: string,
-  logContext: 'single' | 'batch' = 'single',
-): Promise<{ assembled: any | null }> {
-  try {
-    const dbRes = await getTranscriptByVideoAndLanguage(videoId, effectiveLang || '');
-    if (!dbRes) {
-      logger.debug(`${logContext === 'batch' ? 'Batch ' : ''}DB miss for transcript`, { videoId, language: effectiveLang, requestId });
-      return { assembled: null };
-    }
-
-    const ageSeconds = computeAgeSeconds(dbRes.updatedAt);
-    if (ageSeconds < ttlSeconds) {
-      const remaining = Math.max(1, ttlSeconds - ageSeconds);
-      const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, requestId);
-      logger.info(`${logContext === 'batch' ? 'Batch ' : ''}DB hit within TTL for transcript`, { videoId, language: dbRes.language, ageSeconds, remaining, requestId });
-      await setAliasIfNoRequested(videoId, requestedLang, dbRes.language, remaining);
-      return { assembled };
-    }
-
-    // Stale-while-revalidate
-    logger.info(`${logContext === 'batch' ? 'Batch ' : ''}DB hit but stale; will fetch`, { videoId, language: effectiveLang, ageSeconds, ttlSeconds, requestId });
-    const assembled = await assembleFromDbAndCache(c, videoId, dbRes, Math.max(1, Math.floor(ttlSeconds / 10)), requestId);
-    if (logContext === 'single') {
-      void (async () => {
-        try {
-          const { resolvedLang } = await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
-            return await fetchPersistAndCache(c, videoId, effectiveLang, ttlSeconds, requestId);
-          });
-          await setAliasIfNoRequested(videoId, requestedLang, resolvedLang, ttlSeconds);
-        } catch (e) {
-          const mapped = mapErrorToHttp(e);
-          await negativeCacheIfLanguageRelated(cacheKey, mapped, requestId);
-        }
-      })();
-    }
-    return { assembled };
-  } catch (dbErr) {
-    logger.error(`${logContext === 'batch' ? 'DB check for transcript (batch)' : 'DB check for transcript'} failed; continuing`, { videoId, language: effectiveLang, requestId, error: dbErr });
-    return { assembled: null };
-  }
-}
 
 // Shared single-fetch used by GET route (mirrors batchFetchOne behavior but returns same shape)
 async function fetchOne(
@@ -244,32 +90,76 @@ async function fetchOne(
 ) {
   const requestId = c.get('requestId');
   const { effectiveLang } = await resolveEffectiveLanguage(videoId, requestedLang, requestId);
+  const ttlSeconds = c.get('config').TRANSCRIPT_CACHE_TTL_SECONDS as number;
   const cacheKey = buildCacheKey(videoId, effectiveLang);
-  const ttlSeconds = c.get('config').TRANSCRIPT_CACHE_TTL_SECONDS;
 
-  const cached = await getCachedJson<any>(cacheKey);
-  if (cached) {
-    logger.info('Cache hit for transcript', { videoId, language: effectiveLang, requestId, cacheKey });
-    if (isNegativeCache(cached)) return { __error: true, error: cached.error, code: cached.code, __status: (cached as any).__status ?? 400 };
-    return { data: cached };
-  }
+  const result = await swrResolve<any, { language: string; segments: Array<{ text: string }>; updatedAt: Date }>(
+    {
+      cacheKey,
+      ttlSeconds,
+      serveStale: true,
+      getFromDb: async () => await getTranscriptByVideoAndLanguage(videoId, effectiveLang || ''),
+      dbUpdatedAt: (db) => db.updatedAt,
+      assembleFromDb: async (dbRes, remainingTtl) => {
+        let videoDb = await getVideoById(videoId);
+        if (!videoDb) {
+          try {
+            const videoInfo = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
+            videoDb = { video: videoInfo, updatedAt: new Date() } as any;
+          } catch (videoErr) {
+            logger.error('Failed to get video info while assembling transcript response', { videoId, requestId, error: videoErr });
+          }
+        }
+        const textFromSegments = (dbRes.segments || []).map(s => s.text).join(' ').trim();
+        const assembled = videoDb ? {
+          ...videoDb.video,
+          transcript: {
+            language: dbRes.language,
+            segments: dbRes.segments,
+            text: textFromSegments,
+          },
+        } : {
+          id: videoId,
+          transcript: {
+            language: dbRes.language,
+            segments: dbRes.segments,
+            text: textFromSegments,
+          }
+        } as any;
+        if (!requestedLang) {
+          try { await setAlias(videoId, dbRes.language, Math.max(1, remainingTtl)); } catch { /* noop */ }
+        }
+        return assembled;
+      },
+      fetchPersist: async () => {
+        logger.info('Cache miss for transcript, fetching from YouTube', { videoId, language: effectiveLang, requestId });
+        const info = await c.get('innertubeSvc').getTranscript(videoId, effectiveLang ?? undefined, { signal: c.get('signal'), requestId });
+        const resolvedLang = (info as any)?.transcript?.language ?? effectiveLang ?? 'default';
 
-  const fromDb = await tryServeFromDb(c, videoId, effectiveLang, requestedLang, ttlSeconds, requestId, cacheKey, 'single');
-  if (fromDb.assembled) return { data: fromDb.assembled };
+        try {
+          const vres = await upsertVideo(info as any);
+          logger.debug('Video upsert completed prior to transcript', { videoId, upserted: (vres as any)?.upserted, requestId });
+        } catch (videoPersistErr) {
+          logger.error('Video upsert failed prior to transcript', { videoId, requestId, error: videoPersistErr });
+        }
 
-  try {
-    const { info, resolvedLang } = await singleflight(cacheKey, async () => {
-      return await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
-        return await fetchPersistAndCache(c, videoId, effectiveLang, ttlSeconds, requestId);
-      });
-    });
-    await setAliasIfNoRequested(videoId, requestedLang, resolvedLang, ttlSeconds);
-    return { data: info };
-  } catch (e) {
-    const mapped = mapErrorToHttp(e);
-    await negativeCacheIfLanguageRelated(cacheKey, mapped, requestId, 'transcript');
-    return { __error: true, error: mapped.message || 'Internal Server Error', code: mapped.code, __status: mapped.status };
-  }
+        try {
+          await upsertTranscript(videoId, resolvedLang, { segments: (info as any).transcript?.segments });
+          logger.info('Transcript upsert completed', { videoId, language: resolvedLang, requestId });
+        } catch (persistErr) {
+          logger.error('Transcript upsert failed', { videoId, language: resolvedLang, requestId, error: persistErr });
+        }
+
+        if (!requestedLang) {
+          try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch { /* noop */ }
+        }
+        return info as any;
+      },
+      shouldNegativeCache: (status, code) => (status >= 400 && status < 500 && LANG_RELATED_CODES.has(code as ErrorCode)),
+    }
+  );
+
+  return result as any;
 }
 
 v1InnertubeTranscriptRouter.get('/', navigationMiddleware(), async (c: Context<AppSchema>) => {

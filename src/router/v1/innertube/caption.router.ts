@@ -5,8 +5,8 @@ import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODE
 import type { ErrorCode } from '@/lib/hono.util';
 import { HttpError } from '@/lib/http.lib';
 import { z } from 'zod';
-import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
-import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegativeCache } from '@/lib/cache.util';
+import { redisGetJson, redisSetJson, redisSetJsonGzip } from '@/lib/redis.lib';
+import { swrResolve, jitterTtl } from '@/lib/cache.util';
 import { getCaptionByVideoAndLanguage, hasCaptionLanguage, getPreferredCaptionLanguage, upsertCaption } from '@/service/caption.service';
 import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
 import { getVideoById, upsertVideo } from '@/service/video.service';
@@ -17,6 +17,14 @@ import { navigationBatchMiddleware } from '@/middleware/navigation-batch.middlew
 export const v1InnertubeCaptionRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:caption');
 logger.debug('Initializing /v1/innertube/caption router');
+
+// Only negative-cache language-related 4xx codes
+const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode> ([
+  ERROR_CODES.INVALID_LANGUAGE,
+  ERROR_CODES.INVALID_TRANSLATE_LANGUAGE,
+  ERROR_CODES.YT_TRANSLATION_UNSUPPORTED,
+  ERROR_CODES.YT_TRANSLATION_SAME_LANGUAGE,
+]);
 
 function buildCacheKey(videoId: string, language: string | undefined | null, translateLanguage?: string | null): string {
   const cacheLang = language ?? 'default';
@@ -72,81 +80,6 @@ async function resolveEffectiveLanguage(videoId: string, requestedLang: string |
   return { effectiveLang: '', source: 'default' };
 }
 
-async function assembleFromDbAndCache(c: Context<AppSchema>, videoId: string, dbRes: { language: string; segments: Array<{ text: string }>; words: Array<{ text: string }>; updatedAt: Date; }, remainingTtl: number, translateLanguage?: string | null, requestId?: string) {
-  const ttlSeconds = jitterTtl(Math.max(1, remainingTtl));
-  let videoDb = await getVideoById(videoId);
-  if (!videoDb) {
-    try {
-      const videoInfo = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
-      videoDb = { video: videoInfo, updatedAt: new Date() } as any;
-    } catch (videoErr) {
-      logger.error('Failed to get video info while assembling caption response', { videoId, requestId, error: videoErr });
-    }
-  }
-  const textFromSegments = (dbRes.segments || []).map(s => s.text).join(' ').trim();
-
-  const assembled = videoDb ? {
-    ...videoDb.video,
-    caption: {
-      hascaption: (dbRes.segments?.length ?? 0) > 0 || (dbRes.words?.length ?? 0) > 0 || textFromSegments.length > 0,
-      language: dbRes.language,
-      segments: dbRes.segments,
-      words: dbRes.words,
-      text: textFromSegments,
-    },
-  } : {
-    id: videoId,
-    caption: {
-      hascaption: (dbRes.segments?.length ?? 0) > 0 || (dbRes.words?.length ?? 0) > 0 || textFromSegments.length > 0,
-      language: dbRes.language,
-      segments: dbRes.segments,
-      words: dbRes.words,
-      text: textFromSegments,
-    }
-  } as any;
-
-  const cacheKey = buildCacheKey(videoId, dbRes.language, translateLanguage);
-  try {
-    await redisSetJson(cacheKey, assembled, ttlSeconds);
-    logger.debug('Caption cached from DB', { videoId, language: dbRes.language, remaining: ttlSeconds, requestId });
-  } catch (cacheErrDb) {
-    logger.error('Caption caching from DB failed', { videoId, language: dbRes.language, requestId, error: cacheErrDb });
-  }
-  return assembled;
-}
-
-async function fetchPersistAndCache(c: Context<AppSchema>, videoId: string, effectiveLang: string | undefined | null, translateLanguage: string | undefined | null, ttlSeconds: number, requestId?: string) {
-  logger.info('Cache miss for caption, fetching from YouTube', { videoId, language: effectiveLang, translateLanguage, requestId });
-  const info = await c.get('innertubeSvc').getCaption(videoId, effectiveLang ?? undefined, translateLanguage ?? undefined, { signal: c.get('signal'), requestId });
-  const resolvedLang = info?.caption?.language || effectiveLang || 'default';
-
-  // Ensure parent video row exists to satisfy FK
-  try {
-    const vres = await upsertVideo(info as any);
-    logger.debug('Video upsert completed prior to caption', { videoId, upserted: vres.upserted, requestId });
-  } catch (videoPersistErr) {
-    logger.error('Video upsert failed prior to caption', { videoId, requestId, error: videoPersistErr });
-  }
-
-  try {
-    const segs = info.caption.segments;
-    const words = info.caption.words;
-    await upsertCaption(videoId, resolvedLang, { segments: segs, words, targetLanguage: translateLanguage ?? null });
-    logger.info('Caption upsert completed', { videoId, language: resolvedLang, targetLanguage: translateLanguage ?? null, requestId });
-  } catch (persistErr) {
-    logger.error('Caption upsert failed', { videoId, language: resolvedLang, requestId, error: persistErr });
-  }
-
-  try {
-    const cacheKeyResolved = buildCacheKey(videoId, resolvedLang, translateLanguage ?? undefined);
-    await redisSetJson(cacheKeyResolved, info, jitterTtl(ttlSeconds));
-    return { info, resolvedLang } as const;
-  } catch (cacheErr) {
-    logger.error('Caption caching failed', { videoId, language: resolvedLang, requestId, error: cacheErr });
-    return { info, resolvedLang } as const;
-  }
-}
-
 type FetchOptions = { swrOnStale?: boolean };
 
 // Unified single-item resolver used by both GET and batch routes
@@ -159,8 +92,8 @@ async function fetchOne(
 ) {
   const requestId = c.get('requestId');
   const { effectiveLang } = await resolveEffectiveLanguage(videoId, requestedLang, requestId);
+  const ttlSeconds = c.get('config').CAPTION_CACHE_TTL_SECONDS as number;
   const cacheKey = buildCacheKey(videoId, effectiveLang, translateLanguage);
-  const ttlSeconds = c.get('config').CAPTION_CACHE_TTL_SECONDS;
 
   // Early translate-language validation from video metadata when available
   if (translateLanguage) {
@@ -177,90 +110,95 @@ async function fetchOne(
     } catch {/* ignore and proceed */}
   }
 
-  // 1) Cache first
-  const cached = await redisGetJson<any>(cacheKey).catch(() => undefined);
-  if (cached) {
-    logger.info('Cache hit for caption', { videoId, language: effectiveLang, translateLanguage, requestId, cacheKey });
-    if (isNegativeCache(cached)) {
-      return { __error: true, error: cached.error, code: cached.code, __status: (cached as any).__status ?? 400 };
-    }
-    return { data: cached };
-  }
-
-  // 2) DB next
-  try {
-    const dbRes = await getCaptionByVideoAndLanguage(videoId, effectiveLang, translateLanguage ?? null);
-    if (dbRes) {
-      const now = Date.now();
-      const updatedAtMs = new Date(dbRes.updatedAt).getTime();
-      const ageSeconds = Math.max(0, Math.floor((now - updatedAtMs) / 1000));
-      if (ageSeconds < ttlSeconds) {
-        const remaining = Math.max(1, ttlSeconds - ageSeconds);
-        const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, translateLanguage, requestId);
-        logger.info('DB hit within TTL for caption', { videoId, language: dbRes.language, targetLanguage: translateLanguage ?? null, ageSeconds, remaining, requestId });
-        if (!requestedLang && !translateLanguage) { try { await setAlias(videoId, dbRes.language, remaining); } catch { /* noop */ } }
-        return { data: assembled };
-      }
-      // SWR mode: return stale and refresh in background
-      if (opts.swrOnStale) {
-        const remaining = 60;
-        const assembled = await assembleFromDbAndCache(c, videoId, dbRes, remaining, translateLanguage, requestId);
-        logger.info('DB hit but stale; serving stale and refreshing in background (caption)', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, ageSeconds, ttlSeconds, requestId });
-        const bgKey = buildCacheKey(videoId, effectiveLang, translateLanguage);
-        void (async () => {
+  const result = await swrResolve<any, { language: string; segments: Array<{ text: string }>; words: Array<{ text: string }>; updatedAt: Date }>(
+    {
+      cacheKey,
+      ttlSeconds,
+      serveStale: !!opts.swrOnStale,
+      getFromDb: async () => await getCaptionByVideoAndLanguage(videoId, effectiveLang, translateLanguage ?? null),
+      dbUpdatedAt: (db) => db.updatedAt,
+      assembleFromDb: async (dbRes, remainingTtl) => {
+        // Build the final response payload from DB data; also set alias if no explicit language/translate requested
+        let videoDb = await getVideoById(videoId);
+        if (!videoDb) {
           try {
-            const { resolvedLang } = await fetchWithRedisLock(bgKey, ttlSeconds, async () => {
-              return await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
-            });
-            if (!requestedLang && !translateLanguage) {
-              try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch { /* noop */ }
-            }
-          } catch (e) {
-            const mapped = mapErrorToHttp(e);
-            if (mapped.status >= 400 && mapped.status < 500) {
-              const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-              try { await redisSetJson(bgKey, neg, jitterTtl(60)); } catch { /* noop */ }
-            }
+            const videoInfo = await c.get('innertubeSvc').getVideoInfo(videoId, { signal: c.get('signal'), requestId });
+            videoDb = { video: videoInfo, updatedAt: new Date() } as any;
+          } catch (videoErr) {
+            logger.error('Failed to get video info while assembling caption response', { videoId, requestId, error: videoErr });
           }
-        })();
-        return { data: assembled };
-      }
-    }
-  } catch (dbErr) {
-    logger.error('DB check for caption failed; will fetch', { videoId, language: effectiveLang, targetLanguage: translateLanguage ?? null, requestId, error: dbErr });
-  }
+        }
+        const textFromSegments = (dbRes.segments || []).map(s => s.text).join(' ').trim();
+        const assembled = videoDb ? {
+          ...videoDb.video,
+          caption: {
+            hascaption: (dbRes.segments?.length ?? 0) > 0 || (dbRes.words?.length ?? 0) > 0 || textFromSegments.length > 0,
+            language: dbRes.language,
+            segments: dbRes.segments,
+            words: (dbRes as any).words,
+            text: textFromSegments,
+          },
+        } : {
+          id: videoId,
+          caption: {
+            hascaption: (dbRes.segments?.length ?? 0) > 0 || (dbRes as any).words?.length > 0 || textFromSegments.length > 0,
+            language: dbRes.language,
+            segments: dbRes.segments,
+            words: (dbRes as any).words,
+            text: textFromSegments,
+          }
+        } as any;
+        if (!requestedLang && !translateLanguage) {
+          try { await setAlias(videoId, dbRes.language, Math.max(1, remainingTtl)); } catch { /* noop */ }
+        }
+        return assembled;
+      },
+      fetchPersist: async () => {
+        logger.info('Cache miss for caption, fetching from YouTube', { videoId, language: effectiveLang, translateLanguage, requestId });
+        const info = await c.get('innertubeSvc').getCaption(videoId, effectiveLang ?? undefined, translateLanguage ?? undefined, { signal: c.get('signal'), requestId });
+        const resolvedLang = (info as any)?.caption?.language || effectiveLang || 'default';
 
-  // 3) Fetch -> persist -> cache
-  try {
-    const res = await singleflight(cacheKey, async () => {
-      return await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
-        return await fetchPersistAndCache(c, videoId, effectiveLang, translateLanguage, ttlSeconds, requestId);
-      });
-    });
-    const { info, resolvedLang } = res;
-    if (!requestedLang && !translateLanguage) { try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch { /* noop */ } }
-    return { data: info };
-  } catch (e) {
-    const mapped = mapErrorToHttp(e);
-    if (mapped.status >= 400 && mapped.status < 500) {
-      const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch { /* noop */ }
+        // Ensure parent video row exists to satisfy FK
+        try {
+          const vres = await upsertVideo(info as any);
+          logger.debug('Video upsert completed prior to caption', { videoId, upserted: (vres as any)?.upserted, requestId });
+        } catch (videoPersistErr) {
+          logger.error('Video upsert failed prior to caption', { videoId, requestId, error: videoPersistErr });
+        }
+
+        try {
+          const segs = (info as any).caption?.segments;
+          const words = (info as any).caption?.words;
+          await upsertCaption(videoId, resolvedLang, { segments: segs, words, targetLanguage: translateLanguage ?? null });
+          logger.info('Caption upsert completed', { videoId, language: resolvedLang, targetLanguage: translateLanguage ?? null, requestId });
+        } catch (persistErr) {
+          logger.error('Caption upsert failed', { videoId, language: resolvedLang, requestId, error: persistErr });
+        }
+
+        // Maintain alias and also populate cache under the resolved language key for consistency
+        if (!requestedLang && !translateLanguage) {
+          try { await setAlias(videoId, resolvedLang, ttlSeconds); } catch { /* noop */ }
+        }
+        try {
+          const cacheKeyResolved = buildCacheKey(videoId, resolvedLang, translateLanguage ?? undefined);
+          if (cacheKeyResolved !== cacheKey) {
+            await redisSetJsonGzip(cacheKeyResolved, info, jitterTtl(ttlSeconds));
+          }
+        } catch { /* noop */ }
+
+        return info;
+      },
+      shouldNegativeCache: (status, code) => (status >= 400 && status < 500 && LANG_RELATED_CODES.has(code as ErrorCode)),
     }
-    return { __error: true, error: mapped.message || 'Internal Server Error', code: mapped.code, __status: mapped.status };
-  }
+  );
+
+  return result as any;
 }
 
 v1InnertubeCaptionRouter.get('/', navigationMiddleware(), async (c: Context<AppSchema>) => {
   const requestId = c.get('requestId');
   const l = c.req.query('l');
   const tl = c.req.query('tl');
-  // Only negative-cache these language-related 4xx codes
-  const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode> ([
-    ERROR_CODES.INVALID_LANGUAGE,
-    ERROR_CODES.INVALID_TRANSLATE_LANGUAGE,
-    ERROR_CODES.YT_TRANSLATION_UNSUPPORTED,
-    ERROR_CODES.YT_TRANSLATION_SAME_LANGUAGE,
-  ]);
 
   const QuerySchema = z.object({
     l: z.string().trim().optional(),
