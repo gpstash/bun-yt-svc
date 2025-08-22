@@ -2,6 +2,7 @@ import { describe, expect, test, mock } from 'bun:test';
 import {
   isValidYoutubeChannelUrl,
   isValidYoutubeWatchUrl,
+  isValidYoutubePlaylistUrl,
   isValidHandle,
   isValidChannelId,
   isValidVideoId,
@@ -9,6 +10,8 @@ import {
   buildWatchUrlFromVideoId,
   buildChannelUrlFromHandle,
   buildYoutubeUrlFromId,
+  isValidPlaylistId,
+  buildPlaylistUrlFromId,
 } from './navigation.helper';
 
 // Helper to generate unique test names
@@ -46,6 +49,31 @@ describe('isValidYoutubeChannelUrl', () => {
   invalid.forEach((url) =>
     test(tname('invalid channel', url), () => {
       expect(isValidYoutubeChannelUrl(url)).toBe(false);
+    }),
+  );
+});
+
+describe('isValidYoutubePlaylistUrl', () => {
+  const valid = [
+    'https://www.youtube.com/playlist?list=PLabcdef0123456789',
+    'https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabcdef0123456789',
+  ];
+
+  const invalid = [
+    'https://www.youtube.com/playlist',
+    'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+    'https://youtu.be/dQw4w9WgXcQ',
+  ];
+
+  valid.forEach((url) =>
+    test(tname('valid playlist', url), () => {
+      expect(isValidYoutubePlaylistUrl(url)).toBe(true);
+    }),
+  );
+
+  invalid.forEach((url) =>
+    test(tname('invalid playlist', url), () => {
+      expect(isValidYoutubePlaylistUrl(url)).toBe(false);
     }),
   );
 });
@@ -263,6 +291,14 @@ describe('buildYoutubeUrlFromId (shared)', () => {
     expect(buildYoutubeUrlFromId('   ')).toBeNull();
     expect(buildYoutubeUrlFromId('not a url and not valid id')).toBeNull();
   });
+
+  test('accepts playlist URL as-is and builds from playlist id', () => {
+    const playlistUrl = 'https://www.youtube.com/playlist?list=PLabcdef0123456789';
+    expect(buildYoutubeUrlFromId(playlistUrl)).toBe(playlistUrl);
+
+    const playlistId = 'PLabcdef0123456789';
+    expect(buildYoutubeUrlFromId(playlistId)).toBe(`https://www.youtube.com/playlist?list=${playlistId}`);
+  });
 });
 
 describe('resolveNavigationWithCache', () => {
@@ -320,5 +356,18 @@ describe('resolveNavigationWithCache', () => {
     expect(calls.some(c => c.fn === 'set' && c.key === keyWatch && c.ttl === 300)).toBe(true);
     expect(calls.some(c => c.fn === 'get' && c.key === keyChannel)).toBe(true);
     expect(calls.some(c => c.fn === 'set' && c.key === keyChannel && c.ttl === 600)).toBe(true);
+
+    // Miss path (playlist URL) should use 'playlist' key type and channel TTL
+    const urlPlaylist = 'https://www.youtube.com/playlist?list=PLabcdef0123456789';
+    const keyPlaylist = `yt:navigation:playlist:${Buffer.from(urlPlaylist, 'utf-8').toString('base64')}`;
+    const resPlaylist1 = await resolveNavigationWithCache(
+      { resolveURL: async (_u: string) => ({ type: 'playlist', list: 'PLabcdef0123456789' }) },
+      urlPlaylist,
+      config,
+    );
+    expect(resPlaylist1).toEqual({ type: 'playlist', list: 'PLabcdef0123456789' });
+    expect(cache[keyPlaylist]).toEqual(resPlaylist1);
+    expect(calls.some(c => c.fn === 'get' && c.key === keyPlaylist)).toBe(true);
+    expect(calls.some(c => c.fn === 'set' && c.key === keyPlaylist && c.ttl === 600)).toBe(true);
   });
 });

@@ -38,6 +38,20 @@ export function isValidYoutubeWatchUrl(url: string): boolean {
   }
 }
 
+export function isValidYoutubePlaylistUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (!isHttpProtocol(u.protocol)) return false;
+    if (!isYoutubeHost(u.hostname)) return false;
+    // Accept /playlist?list=... or /watch?list=... (but watch-with-videoId is handled by isValidYoutubeWatchUrl first)
+    const hasList = !!u.searchParams.get('list');
+    const pathOk = u.pathname === '/playlist' || u.pathname === '/watch';
+    return hasList && pathOk;
+  } catch {
+    return false;
+  }
+}
+
 export function isValidHandle(handle: string): boolean {
   // Accept forms: "@handle", "handle", optional leading '/'
   const trimmed = handle.trim();
@@ -87,6 +101,18 @@ export function buildChannelUrlFromHandle(input: string): string | null {
   return `https://www.youtube.com/${h}`;
 }
 
+export function isValidPlaylistId(id: string): boolean {
+  // Be permissive: YouTube playlist IDs are typically >= 16 chars and alnum/_/-
+  const s = id.trim();
+  return /^[A-Za-z0-9_-]{16,100}$/.test(s);
+}
+
+export function buildPlaylistUrlFromId(input: string): string | null {
+  if (!isValidPlaylistId(input)) return null;
+  const id = input.trim();
+  return `https://www.youtube.com/playlist?list=${id}`;
+}
+
 // Shared function: build a canonical YouTube URL from an arbitrary id or URL
 // - Accepts direct YouTube channel/video URLs, channelId (UC...), videoId, or handle
 // - Returns canonical URL string or null if unsupported
@@ -103,11 +129,17 @@ export function buildYoutubeUrlFromId(id: string): string | null {
     const vid = extractVideoIdFromUrl(trimmed);
     return vid ? buildWatchUrlFromVideoId(vid) : trimmed;
   }
+  if (isValidYoutubePlaylistUrl(trimmed)) {
+    return trimmed;
+  }
   if (isValidChannelId(trimmed)) {
     return buildChannelUrlFromId(trimmed) ?? null;
   }
   if (isValidVideoId(trimmed)) {
     return buildWatchUrlFromVideoId(trimmed) ?? null;
+  }
+  if (isValidPlaylistId(trimmed)) {
+    return buildPlaylistUrlFromId(trimmed) ?? null;
   }
   if (isValidHandle(trimmed)) {
     return buildChannelUrlFromHandle(trimmed) ?? null;
@@ -187,10 +219,12 @@ export async function resolveNavigationWithCache(
   },
 ): Promise<any> {
   const isWatch = isValidYoutubeWatchUrl(url);
+  const isPlaylist = !isWatch && isValidYoutubePlaylistUrl(url);
   const videoTtl = config.VIDEO_CACHE_TTL_SECONDS;
   const channelTtl = config.CHANNEL_CACHE_TTL_SECONDS;
   const ttl = isWatch ? videoTtl : channelTtl;
-  const cacheKey = `yt:navigation:${isWatch ? 'watch' : 'channel'}:${encodeUrl(url)}`;
+  const keyType = isWatch ? 'watch' : (isPlaylist ? 'playlist' : 'channel');
+  const cacheKey = `yt:navigation:${keyType}:${encodeUrl(url)}`;
 
   const cached = await redisGetJson<any>(cacheKey).catch(() => null);
   if (cached) return cached;

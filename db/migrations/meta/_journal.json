@@ -29,6 +29,13 @@
       "when": 1755687103650,
       "tag": "0003_channels_table",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1755831694669,
+      "tag": "0004_playlists_table",
+      "breakpoints": true
     }
   ]
 }

@@ -82,3 +82,16 @@ export const channels = ytSvc.table('channels', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
 
+// Playlists table to persist lightweight playlist info
+export const playlists = ytSvc.table('playlists', {
+  id: text('id').primaryKey(),
+  title: text('title').notNull(),
+  description: text('description').notNull(),
+  subtitle: text('subtitle'),
+  author: jsonb('author').$type<{ id?: string; name?: string; url?: string }>().notNull(),
+  videoCount: text('video_count').notNull(),
+  viewCount: text('view_count').notNull(),
+  lastUpdated: text('last_updated'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+});
