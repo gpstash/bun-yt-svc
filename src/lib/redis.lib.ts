@@ -6,6 +6,9 @@ import { parseConfig } from '@/config';
 const logger = createLogger('lib:redis');
 
 let client: Redis | undefined;
+// Allow tests to inject a custom Redis factory to avoid real connections
+type RedisFactory = () => Redis | undefined;
+let redisFactory: RedisFactory | undefined;
 
 // Compress values larger than this many bytes (after JSON.stringify)
 const COMPRESS_THRESHOLD_BYTES = 8 * 1024; // 8KB
@@ -52,8 +55,15 @@ function createClient(): Redis | undefined {
 
 export function getRedis(): Redis | undefined {
   if (client) return client;
-  client = createClient();
+  const factory = redisFactory ?? createClient;
+  client = factory();
   return client;
+}
+
+// Test-only hook: inject a fake Redis factory. No-op in production.
+export function __setRedisFactory(factory?: RedisFactory) {
+  redisFactory = factory;
+  client = undefined; // reset cached client so next getRedis() uses the factory
 }
 
 export async function redisGetJson<T>(key: string): Promise<T | null> {

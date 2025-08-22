@@ -1088,6 +1088,7 @@ export class InnertubeService {
     ) as FetchWithPreconnect as unknown as typeof fetch;
 
     const innertubeConfig = {
+      lang: 'en',
       // Reuse session data across Innertube instances to reduce bootstrap traffic and flakiness
       enable_session_cache: true,
       // If we generate session locally, do not hit network to retrieve config

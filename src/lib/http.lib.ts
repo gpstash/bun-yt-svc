@@ -3,6 +3,12 @@ import { createLogger } from '@/lib/logger.lib';
 
 const logger = createLogger('lib:http');
 
+// Test-only: allow injecting a custom fetch implementation
+let injectedFetch: typeof fetch | undefined;
+export function __setFetch(fn?: typeof fetch) {
+  injectedFetch = fn;
+}
+
 export interface HttpOptions {
   /** Per-attempt timeout in milliseconds (alias: timeoutMs). */
   timeout?: number;
@@ -187,7 +193,8 @@ export const http = async (
       // Attach Bun fetch native proxy option if enabled
       const requestInit: RequestInit & { proxy?: string } = { ...init, signal: mergedSignal };
       if (proxyUrl) requestInit.proxy = proxyUrl;
-      const response = await fetch(url as any, requestInit as RequestInit);
+      const doFetch = injectedFetch ?? fetch;
+      const response = await doFetch(url as any, requestInit as RequestInit);
 
       if (response.ok) {
         logger.verbose('response ok', { url: String(url), status: response.status });
