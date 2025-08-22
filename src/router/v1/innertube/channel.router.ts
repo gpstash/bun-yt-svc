@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { YTNodes } from "youtubei.js"
 import { AppSchema } from "@/app";
 import { createLogger } from "@/lib/logger.lib";
 import type { Context } from "hono";
@@ -7,6 +6,7 @@ import { ERROR_CODES, mapErrorToHttp, isClientAbort, STATUS_CLIENT_CLOSED_REQUES
 import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
 import { jitterTtl, singleflight, fetchWithRedisLock, isNegativeCache, makeNegativeCache } from '@/lib/cache.util';
 import { upsertChannel, getChannelById } from '@/service/channel.service';
+import type { ChannelVideo } from '@/service/innertube.service';
 import { z } from 'zod';
 import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
 import type { ChannelBatchResponse } from '@/types/navigation.types';
@@ -19,6 +19,10 @@ logger.debug('Initializing /v1/innertube/channel router');
 
 function buildCacheKey(channelId: string) {
   return `yt:channel:${channelId}`;
+}
+
+function buildVideosCacheKey(channelId: string) {
+  return `yt:channel:${channelId}:videos`;
 }
 
 // Shared fetcher: cache -> DB (optionally serve-stale) -> fetch/persist/cache
@@ -104,16 +108,7 @@ async function fetchChannel(
   }
 }
 
-// Local helpers for this router only
-function sleep(ms: number) { return new Promise((res) => setTimeout(res, ms)); }
-function rand(min: number, max: number) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-
-function mapGridVideos(videos: YTNodes.GridVideo[]) {
-  return videos.map((video) => ({
-    id: video.video_id,
-    title: video.title?.text ?? '',
-  }));
-}
+// No local helpers; pagination lives in InnertubeService
 
 v1InnertubeChannelRouter.get('/', navigationMiddleware(), async (c: Context<AppSchema>) => {
   const requestId = c.get('requestId');
@@ -150,95 +145,80 @@ v1InnertubeChannelRouter.get('/videos', navigationMiddleware(), async (c: Contex
   const channelId = navigationEndpoint?.payload?.browseId;
   if (!channelId) return c.json({ error: 'Channel ID not found', code: ERROR_CODES.BAD_REQUEST }, 400);
 
+  type CacheShape = {
+    items: ChannelVideo[];
+    firstId: string | null;
+    updatedAt: number; // ms
+    staleAt: number; // ms
+    ttlSeconds: number; // policy TTL for staleness check
+  };
+
   try {
     const cfg: any = c.get('config');
     const signal = c.get('signal') as AbortSignal | undefined;
     const { minDelayMs, maxDelayMs } = readBatchThrottle(cfg, { maxConcurrency: 2, minDelayFloorMs: 50 });
+    const ttlSeconds = cfg.CHANNEL_CACHE_TTL_SECONDS as number; // reuse channel ttl as staleness policy
 
-    const channel = await c.get('innertubeSvc').getInnertube().getChannel(channelId);
-    let page: any = await channel.getVideos();
+    const key = buildVideosCacheKey(channelId);
 
-    const videos: { id: string; title: string; }[] = mapGridVideos(page.videos as YTNodes.GridVideo[]);
-    const seen = new Set<string>(videos.map(v => v.id));
-
-    // Track how many pages we loaded (for diagnostics)
-    let pageCount = 1;
-
-    // Loop through continuations until exhausted with retry/backoff for transient errors.
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      if (signal?.aborted) {
-        const abortErr: any = new Error('AbortError');
-        abortErr.name = 'AbortError';
-        throw abortErr;
-      }
-      // Stop if no continuation is available (avoid calling getContinuation() needlessly)
-      const hasNext = Boolean((page as any)?.has_continuation ?? (page as any)?.continuation ?? (page as any)?.continuation_command);
-      if (!hasNext) {
-        logger.debug('No continuation available; stop paging', { channelId, pageCount, requestId });
-        break;
-      }
-      const delay = rand(minDelayMs, maxDelayMs);
-      logger.debug('Delaying before fetching channel videos continuation', { channelId, delay, page: pageCount + 1, requestId });
-      await sleep(delay);
-      if (signal?.aborted) {
-        const abortErr: any = new Error('AbortError');
-        abortErr.name = 'AbortError';
-        throw abortErr;
-      }
-
-      // Per-page retry with backoff
-      let attempt = 0;
-      const maxAttempts = 3;
-      let stopPaging = false;
-      while (true) {
-        try {
-          const nextPage: any = await page.getContinuation();
-          const contVideos = mapGridVideos(nextPage.videos as YTNodes.GridVideo[]);
-          let added = 0;
-          for (const v of contVideos) {
-            if (!seen.has(v.id)) {
-              seen.add(v.id);
-              videos.push(v);
-              added++;
-            }
-          }
-          page = nextPage;
-          pageCount++;
-          logger.debug('Continuation page loaded', { channelId, pageCount, added, attempt, requestId });
-          if (added === 0 || contVideos.length === 0) {
-            // No new items; likely exhausted -> stop outer loop
-            stopPaging = true;
-          }
-          // Try to continue outer loop
-          break;
-        } catch (e) {
-          const mapped = mapErrorToHttp(e);
-          const retriable = mapped.status === 429 || mapped.status === 408 || mapped.status >= 500;
-          if (retriable && attempt < maxAttempts - 1 && !signal?.aborted) {
-            attempt++;
-            const backoff = Math.min(maxDelayMs * 2 ** attempt, maxDelayMs * 8);
-            const jitter = rand(minDelayMs, backoff);
-            logger.warn('Retrying continuation fetch with backoff', { channelId, attempt, jitter, status: mapped.status, requestId });
-            await sleep(jitter);
-            continue;
-          }
-          logger.warn('Failed fetching channel videos continuation; stop paging', { channelId, attempt, mapped, pageCount, requestId });
-          // Non-retriable failure -> stop outer loop
-          stopPaging = true;
-          break;
+    const result = await singleflight(key, async () => {
+      const now = Date.now();
+      const cached = await redisGetJson<CacheShape>(key).catch(() => null);
+      if (cached && Array.isArray(cached.items)) {
+        // Fresh enough
+        if (now < cached.staleAt) {
+          logger.info('Channel videos cache hit (fresh)', { channelId, count: cached.items.length, requestId });
+          return cached;
         }
+        // Stale: quick freshness check via first page
+        logger.info('Channel videos cache stale; checking first page', { channelId, count: cached.items.length, requestId });
+        const firstPage = await c.get('innertubeSvc').getChannelVideosFirstPage(channelId, { signal, requestId });
+        const upstreamFirstId = firstPage[0]?.id ?? null;
+        if (upstreamFirstId && upstreamFirstId === cached.firstId) {
+          // No change; extend staleness window
+          const extended: CacheShape = {
+            ...cached,
+            updatedAt: now,
+            staleAt: now + ttlSeconds * 1000,
+            ttlSeconds,
+          };
+          // keep Redis value long-lived; extend moderately long (policy*30)
+          try { await redisSetJson(key, extended, jitterTtl(Math.max(ttlSeconds * 30, ttlSeconds + 1))); } catch { /* noop */ }
+          logger.info('Channel videos cache extended (no changes upstream)', { channelId, requestId });
+          return extended;
+        }
+        // Change detected: fetch all and update cache
+        const videos = await c.get('innertubeSvc').getChannelVideos(channelId, { signal, requestId, minDelayMs, maxDelayMs });
+        const next: CacheShape = {
+          items: videos,
+          firstId: videos[0]?.id ?? null,
+          updatedAt: now,
+          staleAt: now + ttlSeconds * 1000,
+          ttlSeconds,
+        };
+        try { await redisSetJson(key, next, jitterTtl(Math.max(ttlSeconds * 30, ttlSeconds + 1))); } catch { /* noop */ }
+        logger.info('Channel videos cache updated (new video detected)', { channelId, total: videos.length, requestId });
+        return next;
       }
 
-      if (stopPaging) {
-        break;
-      }
-    }
-
-    return c.json({
-      videos,
-      total: videos.length,
+      // No cache yet: fetch all then set
+      const videos = await fetchWithRedisLock(key, ttlSeconds, async () => {
+        const fetched = await c.get('innertubeSvc').getChannelVideos(channelId, { signal, requestId, minDelayMs, maxDelayMs });
+        const payload: CacheShape = {
+          items: fetched,
+          firstId: fetched[0]?.id ?? null,
+          updatedAt: now,
+          staleAt: now + ttlSeconds * 1000,
+          ttlSeconds,
+        };
+        try { await redisSetJson(key, payload, jitterTtl(Math.max(ttlSeconds * 30, ttlSeconds + 1))); } catch { /* noop */ }
+        logger.info('Channel videos cache populated (miss)', { channelId, total: fetched.length, requestId });
+        return payload;
+      }, 4000);
+      return videos;
     });
+
+    return c.json(result.items);
   } catch (err) {
     const mapped = mapErrorToHttp(err);
     logger.error('Error in /v1/innertube/channel/videos', { err, mapped, channelId, requestId });

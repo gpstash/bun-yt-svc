@@ -7,25 +7,25 @@ const logger = createLogger('request');
 
 export function requestLogger(): MiddlewareHandler<AppSchema> {
   return async (c: Context<AppSchema>, next: Next) => {
-    const headerId = c.req.header('x-requestid') || c.req.header('x-request-id') || undefined;
-    const id = headerId && headerId.trim().length > 0 ? headerId.trim() : crypto.randomUUID();
-    c.set('requestId', id as unknown as string);
+    const headerId = c.req.header('x-request-id') || undefined;
+    const requestId = headerId && headerId.trim().length > 0 ? headerId.trim() : crypto.randomUUID();
+    c.set('requestId', requestId as unknown as string);
     const start = Date.now();
     const method = c.req.method;
     const url = c.req.url;
     const userAgent = c.req.header('user-agent');
 
-    logger.info('--- BEGIN REQUEST ---', { id, method, url, userAgent });
     try {
+      logger.info('--- BEGIN REQUEST ---', { method, url, userAgent, requestId });
       await next();
     } catch (err) {
-      logger.error('--- END REQUEST::ERROR ---', { id, method, url, error: err instanceof Error ? err.message : String(err) });
+      logger.error('--- END REQUEST::ERROR ---', { method, url, error: err instanceof Error ? err.message : String(err), requestId });
       throw err;
     } finally {
       const durationMs = Date.now() - start;
       const status = c.res.status;
       const contentLength = c.res.headers.get('content-length') || undefined;
-      logger.info('--- END REQUEST ---', { id, method, url, status, durationMs, contentLength });
+      logger.info('--- END REQUEST ---', { method, url, status, durationMs, contentLength, requestId });
     }
   };
 }

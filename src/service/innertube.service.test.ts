@@ -19,6 +19,73 @@ suiteBeforeAll(() => {
   }));
 });
 
+describe("InnertubeService.getChannelVideos", () => {
+  function makeChannelWithPages(pages: Array<{ videos: Array<{ video_id: string; title?: { text?: string } }> }>, opts?: { failOnceWith?: Error }) {
+    let idx = 0;
+    const mkPage = (i: number): any => ({
+      videos: pages[i]?.videos ?? [],
+      has_continuation: i < pages.length - 1,
+      async getContinuation() {
+        if (opts?.failOnceWith) {
+          const err = opts.failOnceWith;
+          // Consume the failOnceWith so it only fails once
+          (opts as any).failOnceWith = undefined;
+          throw err;
+        }
+        idx = Math.min(idx + 1, pages.length - 1);
+        return mkPage(idx);
+      },
+    });
+    return {
+      async getVideos() { return mkPage(0); },
+    };
+  }
+
+  it("aggregates videos across continuations and de-duplicates by id", async () => {
+    const inn = createInnertubeInstance();
+    (inn as any).getChannel = async () => makeChannelWithPages([
+      { videos: [ { video_id: 'v1', title: { text: 'A' } }, { video_id: 'v2', title: { text: 'B' } } ] },
+      { videos: [ { video_id: 'v2', title: { text: 'B dup' } }, { video_id: 'v3', title: { text: 'C' } } ] },
+    ]);
+
+    const svc = makeSvc(inn);
+    const out = await svc.getChannelVideos('CID', { minDelayMs: 0, maxDelayMs: 0 });
+
+    expect(out.map(v => v.id)).toEqual(['v1', 'v2', 'v3']);
+  });
+
+  it("respects AbortSignal and stops paging", async () => {
+    const inn = createInnertubeInstance();
+    (inn as any).getChannel = async () => makeChannelWithPages([
+      { videos: [ { video_id: 'v1' } ] },
+      { videos: [ { video_id: 'v2' } ] },
+    ]);
+
+    const svc = makeSvc(inn);
+    const controller = new AbortController();
+    // Abort immediately to simulate client cancellation before continuation
+    controller.abort(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+
+    await expect(svc.getChannelVideos('CID', { signal: controller.signal, minDelayMs: 0, maxDelayMs: 0 }))
+      .rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it("retries continuation on transient HttpError and then succeeds", async () => {
+    const inn = createInnertubeInstance();
+    const transient = new HttpLib.HttpError('rate limited', { url: 'https://youtubei', method: 'POST', attemptCount: 1, status: 429 });
+    (inn as any).getChannel = async () => makeChannelWithPages([
+      { videos: [ { video_id: 'v1' } ] },
+      { videos: [ { video_id: 'v2' } ] },
+    ], { failOnceWith: transient });
+
+    const svc = makeSvc(inn);
+    const out = await svc.getChannelVideos('CID', { minDelayMs: 0, maxDelayMs: 0 });
+
+    // Despite first failure, it should retry and include v2 from second page
+    expect(out.map(v => v.id)).toEqual(['v1', 'v2']);
+  });
+});
+
 // Ensure we don't leak mocks to other test files
 afterAll(() => {
   mock.module("@/lib/logger.lib", () => import("@/lib/logger.lib"));

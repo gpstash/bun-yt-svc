@@ -60,7 +60,7 @@ export async function redisGetJson<T>(key: string): Promise<T | null> {
   const r = getRedis();
   if (!r) return null;
   try {
-    if (!r.status || r.status === 'end') await r.connect();
+    if (r.status !== 'ready') await r.connect();
     const data = await r.getBuffer(key as any);
     if (!data) return null;
     // Detect our compression marker when stored as string or buffer
@@ -84,6 +84,7 @@ export async function redisGetJson<T>(key: string): Promise<T | null> {
     }
     return JSON.parse(text) as T;
   } catch (err) {
+    console.log(err)
     logger.error('redisGetJson failed', { key, err });
     return null;
   }
@@ -93,7 +94,7 @@ export async function redisSetJson<T>(key: string, value: T, ttlSeconds: number)
   const r = getRedis();
   if (!r) return;
   try {
-    if (!r.status || r.status === 'end') await r.connect();
+    if (r.status !== 'ready') await r.connect();
     const plain = JSON.stringify(value);
     let toStore: string | Buffer;
     if (Buffer.byteLength(plain, 'utf8') >= COMPRESS_THRESHOLD_BYTES) {
@@ -113,7 +114,7 @@ export async function redisAcquireLock(lockKey: string, ttlMs: number): Promise<
   const r = getRedis();
   if (!r) return null;
   try {
-    if (!r.status || r.status === 'end') await r.connect();
+    if (r.status !== 'ready') await r.connect();
     const token = Math.random().toString(36).slice(2) + Date.now().toString(36);
     const ok = await r.set(lockKey, token, 'PX', ttlMs, 'NX');
     return ok === 'OK' ? token : null;
@@ -134,7 +135,7 @@ export async function redisReleaseLock(lockKey: string, token: string): Promise<
     end
   `;
   try {
-    if (!r.status || r.status === 'end') await r.connect();
+    if (r.status !== 'ready') await r.connect();
     const res = await r.eval(lua, 1, lockKey, token);
     return Number(res) === 1;
   } catch (err) {
@@ -148,7 +149,7 @@ export async function redisWaitForKey<T>(key: string, timeoutMs: number, pollMs 
   if (!r) return null;
   const start = Date.now();
   try {
-    if (!r.status || r.status === 'end') await r.connect();
+    if (r.status !== 'ready') await r.connect();
     while (Date.now() - start < timeoutMs) {
       const data = await r.getBuffer(key as any);
       if (data) {

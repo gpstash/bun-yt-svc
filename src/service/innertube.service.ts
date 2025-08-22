@@ -1,4 +1,5 @@
 import { createLogger } from "@/lib/logger.lib";
+import { mapErrorToHttp } from "@/lib/hono.util";
 import { ClientType, Innertube, Log, UniversalCache, YT, YTNodes } from "youtubei.js";
 import { parseVideoInfo, ParsedVideoInfo, hasCaptions, parseTranscript, ParsedVideoInfoWithTranscript, finCaptionByLanguageCode, ParsedVideoInfoWithCaption } from "@/helper/video.helper";
 import { decodeJson3Caption, buildParsedVideoInfoWithCaption } from "@/helper/caption.helper";
@@ -21,6 +22,15 @@ export interface RequestOptions {
   signal?: AbortSignal;
   requestId?: string;
 }
+
+export interface ChannelVideo {
+  id: string;
+  type: string;
+  title: string;
+  duration: string;
+  published: string;
+  viewCount: string;
+};
 
 export class InnertubeService {
   public static instance: InnertubeService;
@@ -53,6 +63,15 @@ export class InnertubeService {
   public getInnertube(): Innertube {
     return this.innertube;
   }
+
+  // #region small helpers
+  private static sleep(ms: number): Promise<void> {
+    return new Promise((res) => setTimeout(res, ms));
+  }
+  private static rand(min: number, max: number): number {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+  // #endregion
 
   /**
    * Fetch and parse video information with a normalized shape safe for clients.
@@ -247,6 +266,139 @@ export class InnertubeService {
 
     const parsedChannelInfo = await parseChannelInfo(channel);
     return parsedChannelInfo;
+  }
+
+  private mapChannelVideos(arr: YTNodes.Video[]): ChannelVideo[] {
+    return arr.map((v: YTNodes.Video) => ({
+      id: v?.video_id,
+      type: v?.type,
+      title: v?.title?.text ?? '',
+      duration: v?.length_text?.text ?? '0:00',
+      published: v?.published?.text ?? '',
+      viewCount: v?.short_view_count?.text ?? '',
+    }));
+  }
+
+  /**
+   * Fetch channel videos with continuation handling, de-duplication, and basic retry.
+   */
+  public async getChannelVideos(
+    channelId: string,
+    opts?: RequestOptions & { minDelayMs?: number; maxDelayMs?: number; limit?: number }
+  ): Promise<ChannelVideo[]> {
+    const minDelayMs = Math.max(0, opts?.minDelayMs ?? 50);
+    const maxDelayMs = Math.max(minDelayMs, opts?.maxDelayMs ?? 150);
+    // Clamp fetch limit to [30, 5000]; default to max when unspecified
+    const limit = Math.max(30, Math.min(5000, Math.floor(opts?.limit ?? 5000)));
+
+    return await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
+      const ctx = InnertubeService.requestContext.getStore();
+      logger.debug('getChannelVideos:start', { channelId, requestId: ctx?.requestId });
+
+      const channel = await this.innertube.getChannel(channelId) as YT.Channel;
+      let page = await channel.getVideos() as YT.Channel;
+
+      const videos: ChannelVideo[] = this.mapChannelVideos(page.videos as YTNodes.Video[]);
+      const seen = new Set<string>(videos.map(v => v.id).filter(Boolean));
+
+      // Early return if the first page already satisfies the limit
+      if (videos.length >= limit) {
+        logger.info('getChannelVideos:limit-reached:first-page', { channelId, limit, total: videos.length, requestId: ctx?.requestId });
+        return videos.slice(0, limit);
+      }
+
+      let pageCount = 1;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        if (opts?.signal?.aborted) {
+          const abortErr: any = new Error('AbortError');
+          abortErr.name = 'AbortError';
+          throw abortErr;
+        }
+        if (!page.has_continuation) {
+          logger.debug('getChannelVideos:no-continuation', { channelId, pageCount, requestId: ctx?.requestId });
+          break;
+        }
+
+        const delay = Math.floor(Math.random() * (maxDelayMs - minDelayMs + 1)) + minDelayMs;
+        logger.debug('getChannelVideos:delay', { channelId, delay, nextPage: pageCount + 1, requestId: ctx?.requestId });
+        await new Promise((res) => setTimeout(res, delay));
+
+        if (opts?.signal?.aborted) {
+          const abortErr: any = new Error('AbortError');
+          abortErr.name = 'AbortError';
+          throw abortErr;
+        }
+
+        let attempt = 0;
+        const maxAttempts = 3;
+        let stopPaging = false;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          try {
+            const nextPage = await page.getContinuation() as YT.Channel;
+            const contVideos = this.mapChannelVideos(nextPage.videos as YTNodes.Video[]);
+            let added = 0;
+            for (const v of contVideos) {
+              if (v.id && !seen.has(v.id)) {
+                seen.add(v.id);
+                videos.push(v);
+                added++;
+                if (videos.length >= limit) {
+                  // We have reached the cap; stop adding more
+                  break;
+                }
+              }
+            }
+            page = nextPage;
+            pageCount++;
+            logger.debug('getChannelVideos:page-loaded', { channelId, pageCount, added, attempt, requestId: ctx?.requestId });
+            if (videos.length >= limit || added === 0 || contVideos.length === 0) {
+              stopPaging = true;
+            }
+            break;
+          } catch (e) {
+            const mapped = mapErrorToHttp(e);
+            const retriable = mapped.status === 429 || mapped.status === 408 || (mapped.status ?? 0) >= 500;
+            if (retriable && attempt < maxAttempts - 1 && !opts?.signal?.aborted) {
+              attempt++;
+              const backoffMax = Math.min(maxDelayMs * 2 ** attempt, maxDelayMs * 8);
+              const jitter = Math.floor(Math.random() * (backoffMax - minDelayMs + 1)) + minDelayMs;
+              logger.warn('getChannelVideos:retry', { channelId, attempt, jitter, status: mapped.status, requestId: ctx?.requestId });
+              await new Promise((res) => setTimeout(res, jitter));
+              continue;
+            }
+            logger.warn('getChannelVideos:failed-continuation', { channelId, attempt, mapped, pageCount, requestId: ctx?.requestId });
+            stopPaging = true;
+            break;
+          }
+        }
+
+        if (stopPaging) break;
+      }
+
+      const total = Math.min(videos.length, limit);
+      logger.info('getChannelVideos:done', { channelId, total, pages: pageCount, limit, requestId: ctx?.requestId });
+      return videos.slice(0, limit);
+    });
+  }
+
+  /**
+   * Fetch only the first page of channel videos (latest uploads) for quick freshness checks.
+   */
+  public async getChannelVideosFirstPage(
+    channelId: string,
+    opts?: RequestOptions,
+  ): Promise<ChannelVideo[]> {
+    return await InnertubeService.requestContext.run({ signal: opts?.signal, requestId: opts?.requestId }, async () => {
+      const ctx = InnertubeService.requestContext.getStore();
+      logger.debug('getChannelVideosFirstPage:start', { channelId, requestId: ctx?.requestId });
+      const channel = await this.innertube.getChannel(channelId);
+      const page = await channel.getVideos() as YT.Channel;
+      const videos: ChannelVideo[] = this.mapChannelVideos(page.videos as YTNodes.Video[]);
+      logger.info('getChannelVideosFirstPage:done', { channelId, total: videos.length, requestId: ctx?.requestId });
+      return videos;
+    });
   }
 
   // Centralized raw getInfo with 3 attempts when playability appears unavailable (no Po token)
