@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { redisGetJson, redisSetJson, redisSetJsonGzip } from '@/lib/redis.lib';
 import { swrResolve, jitterTtl } from '@/lib/cache.util';
 import { getCaptionByVideoAndLanguage, hasCaptionLanguage, getPreferredCaptionLanguage, upsertCaption } from '@/service/caption.service';
-import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
+import { processBatchIds, extractFromNavigation } from '@/lib/batch.util';
 import { getVideoById, upsertVideo } from '@/service/video.service';
 import { InnertubeService } from '@/service/innertube.service';
 import { navigationMiddleware } from '@/middleware/navigation.middleware';
@@ -306,42 +306,10 @@ v1InnertubeCaptionRouter.post('/batch', navigationBatchMiddleware(), async (c: C
     logger.warn('Player pre-warm failed; proceeding with batch', { requestId, error: e });
   }
 
-  const throttle = readBatchThrottle(c);
-  const out: Record<string, any> = {};
-  const urlById = c.get('batchUrlById') as Map<string, string | null> | undefined;
-  const endpointMap = c.get('navigationEndpointMap') as Map<string, any> | undefined;
-
-  await throttleMap(ids, async (id) => {
-    // If middleware provided URL and endpoint, use it to resolve videoId
-    let videoId: string | undefined;
-    const url = urlById?.get(id) ?? null;
-    if (url !== null && endpointMap) {
-      if (!url) {
-        out[id] = { error: 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed', code: ERROR_CODES.BAD_REQUEST };
-        return;
-      }
-      const ep = endpointMap.get(url);
-      if (!ep) {
-        out[id] = { error: 'Video ID not found', code: ERROR_CODES.BAD_REQUEST };
-        return;
-      }
-      if ((ep as any)?.__error) {
-        out[id] = { error: (ep as any).message, code: (ep as any).code };
-        return;
-      }
-      videoId = (ep as any)?.payload?.videoId as string | undefined;
-      if (!videoId) {
-        out[id] = { error: 'Video ID not found', code: ERROR_CODES.BAD_REQUEST };
-        return;
-      }
-    } else {
-      // Fallback: treat input id as a videoId
-      videoId = id;
-    }
-
-    const r = await fetchOne(c, videoId, l ?? undefined, tl ?? undefined, { swrOnStale: false });
-    out[id] = (r as any)?.__error ? { error: (r as any).error, code: (r as any).code, __status: (r as any).__status } : (r as any)?.data ?? null;
-  }, throttle);
-
-  return c.json(out);
+  const results = await processBatchIds(c, ids, {
+    extractEntityId: extractFromNavigation('videoId', { allowFallbackRawIdWhenNoMap: true }),
+    fetchOne: (entityId: string) => fetchOne(c, entityId, l ?? undefined, tl ?? undefined, { swrOnStale: false }) as any,
+    includeStatusOnError: true,
+  });
+  return c.json(results);
 });

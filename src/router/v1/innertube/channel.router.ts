@@ -10,10 +10,11 @@ import { upsertChannel, getChannelById } from '@/service/channel.service';
 import type { ChannelVideo } from '@/service/innertube.service';
 import type { ParsedChannelInfo } from '@/helper/channel.helper';
 import { z } from 'zod';
-import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
+import { readBatchThrottle } from '@/lib/throttle.util';
 import type { ChannelBatchResponse } from '@/types/navigation.types';
 import { navigationBatchMiddleware } from "@/middleware/navigation-batch.middleware";
 import { navigationMiddleware } from "@/middleware/navigation.middleware";
+import { processBatchIds, extractFromNavigation } from '@/lib/batch.util';
 
 export const v1InnertubeChannelRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:channel');
@@ -199,48 +200,12 @@ v1InnertubeChannelRouter.post('/batch', navigationBatchMiddleware(), async (c: C
   }
 
   try {
-    const results: ChannelBatchResponse = {};
-    const cfg: any = c.get('config');
-    const { concurrency, minDelayMs, maxDelayMs } = readBatchThrottle(cfg, { maxConcurrency: 5, minDelayFloorMs: 50 });
-
-    await throttleMap(
-      ids,
-      async (id) => {
-        const urlById = c.get('batchUrlById') as Map<string, string | null> | undefined;
-        const endpointMap = c.get('navigationEndpointMap') as Map<string, any> | undefined;
-
-        const url = urlById?.get(id) ?? null;
-        if (!url) {
-          results[id] = { error: 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed', code: ERROR_CODES.BAD_REQUEST };
-          return;
-        }
-        const ep = endpointMap?.get(url);
-        if (!ep) {
-          results[id] = { error: 'Channel ID not found', code: ERROR_CODES.BAD_REQUEST };
-          return;
-        }
-        if ((ep as any)?.__error) {
-          results[id] = { error: (ep as any).message, code: (ep as any).code };
-          return;
-        }
-        const channelId = (ep as any)?.payload?.browseId as string | undefined;
-        if (!channelId) {
-          results[id] = { error: 'Channel ID not found', code: ERROR_CODES.BAD_REQUEST };
-          return;
-        }
-
-        const r = await fetchChannel(c, channelId, { serveStale: false });
-        if ((r as any).__error) {
-          results[id] = { error: (r as any).error, code: (r as any).code };
-        } else {
-          results[id] = (r as any).data;
-        }
-      },
-      { concurrency, minDelayMs, maxDelayMs, signal: c.get('signal') as any }
-    );
-
+    const results = await processBatchIds(c, ids, {
+      extractEntityId: extractFromNavigation('browseId'),
+      fetchOne: (entityId: string) => fetchChannel(c, entityId, { serveStale: false }) as any,
+    });
     logger.info('Channel batch processed', { count: ids.length, requestId });
-    return c.json(results);
+    return c.json(results as ChannelBatchResponse);
   } catch (err) {
     const mapped = mapErrorToHttp(err);
     logger.error('Error in /v1/innertube/channel/batch', { err, mapped, requestId });

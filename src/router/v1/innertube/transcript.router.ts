@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
 import { swrResolve } from '@/lib/cache.util';
 import { getTranscriptByVideoAndLanguage, upsertTranscript, getPreferredTranscriptLanguage, hasTranscriptLanguage } from '@/service/transcript.service';
-import { throttleMap, readBatchThrottle } from '@/lib/throttle.util';
+import { processBatchIds, extractFromNavigation } from '@/lib/batch.util';
 import { getVideoById, upsertVideo } from '@/service/video.service';
 import { navigationMiddleware } from '@/middleware/navigation.middleware';
 import { navigationBatchMiddleware } from '@/middleware/navigation-batch.middleware';
@@ -261,42 +261,10 @@ v1InnertubeTranscriptRouter.post('/batch', navigationBatchMiddleware(), async (c
   }
 
   try {
-    const results: Record<string, any> = {};
-    const cfg = c.get('config');
-    const { concurrency, minDelayMs, maxDelayMs } = readBatchThrottle(cfg, { maxConcurrency: 5, minDelayFloorMs: 50 });
-
-    await throttleMap(
-      ids,
-      async (id) => {
-        // If navigationBatchMiddleware provided mappings, use them to extract videoId
-        const urlById = c.get('batchUrlById') as Map<string, string | null> | undefined;
-        const endpointMap = c.get('navigationEndpointMap') as Map<string, any> | undefined;
-        const url = urlById?.get(id) ?? null;
-        if (!url) {
-          results[id] = { error: 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed', code: ERROR_CODES.BAD_REQUEST };
-          return;
-        }
-        const ep = endpointMap?.get(url);
-        if (!ep) {
-          results[id] = { error: 'Video ID not found', code: ERROR_CODES.BAD_REQUEST };
-          return;
-        }
-        if ((ep as any)?.__error) {
-          results[id] = { error: (ep as any).message, code: (ep as any).code };
-          return;
-        }
-        const videoId = (ep as any)?.payload?.videoId as string | undefined;
-        if (!videoId) {
-          results[id] = { error: 'Video ID not found', code: ERROR_CODES.BAD_REQUEST };
-          return;
-        }
-
-        const r = await fetchOne(c, videoId, l);
-        results[id] = (r as any).__error ? { error: (r as any).error, code: (r as any).code } : (r as any).data;
-      },
-      { concurrency, minDelayMs, maxDelayMs, signal: c.get('signal') }
-    );
-
+    const results = await processBatchIds(c, ids, {
+      extractEntityId: extractFromNavigation('videoId'),
+      fetchOne: (entityId: string) => fetchOne(c, entityId, l),
+    });
     logger.info('Transcript batch processed', { count: ids.length, requestId });
     return c.json(results);
   } catch (err) {

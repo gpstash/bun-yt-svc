@@ -9,6 +9,9 @@ import { navigationMiddleware } from "@/middleware/navigation.middleware";
 import { InnertubeService, type ChannelVideo } from "@/service/innertube.service";
 import { readBatchThrottle } from "@/lib/throttle.util";
 import { getPlaylistById, upsertPlaylist, type PlaylistInfo } from "@/service/playlist.service";
+import { z } from 'zod';
+import { navigationBatchMiddleware } from '@/middleware/navigation-batch.middleware';
+import { processBatchIds } from '@/lib/batch.util';
 
 export const v1InnertubePlaylistRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:playlist');
@@ -157,4 +160,62 @@ v1InnertubePlaylistRouter.get('/videos', navigationMiddleware(), async (c: Conte
   }
 });
 
-// Helper removed: moved into InnertubeService.getPlaylistVideos
+// POST /v1/innertube/playlist/batch
+v1InnertubePlaylistRouter.post('/batch', navigationBatchMiddleware(), async (c: Context<AppSchema>) => {
+  const requestId = c.get('requestId');
+  const BodySchema = z.object({
+    ids: z.array(z.string().trim().min(1, 'Invalid playlist id')).min(1, 'ids must not be empty').max(50, 'Max 50 ids per request'),
+  });
+
+  const ctxIds = c.get('batchIds') as string[] | undefined;
+  let ids: string[];
+  if (Array.isArray(ctxIds) && ctxIds.length > 0) {
+    ids = ctxIds;
+  } else {
+    let body: unknown;
+    try { body = await c.req.json(); } catch {
+      logger.warn('Invalid JSON body for /v1/innertube/playlist/batch', { requestId });
+      return c.json({ error: 'Invalid JSON body', code: ERROR_CODES.BAD_REQUEST }, 400);
+    }
+    const parsed = BodySchema.safeParse(body);
+    if (!parsed.success) {
+      const first = parsed.error.issues[0];
+      const msg = first?.message || 'Bad Request';
+      logger.warn('Invalid body for /v1/innertube/playlist/batch', { issues: parsed.error.issues, requestId });
+      return c.json({ error: msg, code: ERROR_CODES.BAD_REQUEST }, 400);
+    }
+    ids = parsed.data.ids;
+  }
+
+  try {
+    const results = await processBatchIds(c, ids, {
+      extractEntityId: (c0, id) => {
+        const urlById = c0.get('batchUrlById') as Map<string, string | null> | undefined;
+        const endpointMap = c0.get('navigationEndpointMap') as Map<string, any> | undefined;
+        const url = urlById?.get(id) ?? null;
+        if (endpointMap && url !== null) {
+          if (!url) return { ok: false, error: 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed', code: ERROR_CODES.BAD_REQUEST } as const;
+          const ep = endpointMap.get(url);
+          if (!ep) return { ok: false, error: 'Playlist ID not found', code: ERROR_CODES.BAD_REQUEST } as const;
+          if ((ep as any).__error) return { ok: false, error: (ep as any).message, code: (ep as any).code } as const;
+          const payload = (ep as any)?.payload || {};
+          const pid = (payload.playlistId as string | undefined) ?? (payload.listId as string | undefined) ?? null;
+          if (pid && typeof pid === 'string') return { ok: true, entityId: pid } as const;
+          const uploads = channelIdToUploads(payload.browseId as string | undefined);
+          if (uploads) return { ok: true, entityId: uploads } as const;
+          return { ok: false, error: 'Playlist ID not found', code: ERROR_CODES.BAD_REQUEST } as const;
+        }
+        const pid = extractPlaylistId(id);
+        if (pid) return { ok: true, entityId: pid } as const;
+        return { ok: false, error: 'Invalid playlist id or URL', code: ERROR_CODES.BAD_REQUEST } as const;
+      },
+      fetchOne: (entityId: string) => fetchPlaylist(c, entityId) as any,
+    });
+    logger.info('Playlist batch processed', { count: ids.length, requestId });
+    return c.json(results);
+  } catch (err) {
+    const mapped = mapErrorToHttp(err);
+    logger.error('Error in /v1/innertube/playlist/batch', { err, mapped, requestId });
+    return c.json({ error: mapped.message || 'Internal Server Error', code: mapped.code }, mapped.status as any);
+  }
+});
