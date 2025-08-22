@@ -100,6 +100,40 @@ Cache keys (examples):
 Negative caching is applied only for specific 4xx cases (e.g., language validation or bad request) to reduce repeat load.
 
 
+## Batch processing helper
+
+Batch endpoints share a centralized helper in `src/lib/batch.util.ts` for consistent concurrency, throttling, error-shaping, and logging.
+
+- `processBatchIds<T>(c, ids, { extractEntityId, fetchOne, includeStatusOnError?, maxConcurrency?, minDelayFloorMs? })`
+  - Reads throttling from env via `readBatchThrottle()`:
+    - `INNERTUBE_BATCH_CONCURRENCY` (default 3, max 10)
+    - `INNERTUBE_BATCH_MIN_DELAY_MS` (default 150)
+    - `INNERTUBE_BATCH_MAX_DELAY_MS` (default 400)
+  - Logs standardized messages:
+    - Batch start/end with counts, duration, and requestId
+    - Per-item extraction/fetch failures (warn) and unexpected errors (error)
+  - Returns an object keyed by the original input id with either data or `{ error, code }` (plus `__status` when `includeStatusOnError=true`).
+
+- `extractFromNavigation(payloadField, { allowFallbackRawIdWhenNoMap? })`
+  - Convenience extractor for use with `navigationBatchMiddleware()` context (`batchUrlById` and `navigationEndpointMap`).
+  - `payloadField` can be `'videoId' | 'browseId' | 'playlistId' | 'listId'` or an array.
+
+Typical usage in routers (example: video batch):
+
+```ts
+const results = await processBatchIds(c, ids, {
+  extractEntityId: extractFromNavigation('videoId'),
+  fetchOne: (videoId) => resolveVideo(c, videoId, { swrOnStale: false }) as any,
+});
+```
+
+Notes:
+
+- Caption batch sets `includeStatusOnError: true` so errors include `__status` for clients.
+- Playlist batch uses a custom extractor to support channel uploads (`UC..` -> `UU..`) and raw playlist ID/url fallback.
+- Ensure `navigationBatchMiddleware()` is mounted so URL->endpoint maps are available to extractors.
+
+
 ## API
 
 Base path: `/v1/innertube`
