@@ -1,8 +1,9 @@
 import type { Context } from 'hono';
 import type { AppSchema } from '@/app';
 import { readBatchThrottle, throttleMap } from '@/lib/throttle.util';
-import type { ErrorCode } from '@/lib/hono.util';
+import { msgChannelIdNotFound, msgNavInputInvalid, msgPayloadFieldsNotFound, msgVideoIdNotFound, type ErrorCode } from '@/lib/hono.util';
 import type { SwrResult } from '@/lib/cache.util';
+import { createLogger } from '@/lib/logger.lib';
 
 export type BatchError = { error: string; code: ErrorCode | string; __status?: number };
 
@@ -35,28 +36,49 @@ export async function processBatchIds<T>(
   const { includeStatusOnError = false, maxConcurrency = 5, minDelayFloorMs = 50 } = opts;
   const cfg: any = c.get('config');
   const { concurrency, minDelayMs, maxDelayMs } = readBatchThrottle(cfg, { maxConcurrency, minDelayFloorMs });
+  const requestId = c.get('requestId');
+  const logger = createLogger('lib:batch');
+  const startedAt = Date.now();
+  logger.info('Batch start', { count: ids.length, concurrency, minDelayMs, maxDelayMs, requestId });
 
   const results: Record<string, T | BatchError> = {};
+  let failures = 0;
+  let successes = 0;
   await throttleMap(
     ids,
     async (id) => {
-      const ex = await opts.extractEntityId(c, id);
-      if (!ex.ok) {
-        results[id] = { error: ex.error, code: ex.code };
-        return;
-      }
-      const r = await opts.fetchOne(ex.entityId);
-      if ((r as any)?.__error) {
-        results[id] = includeStatusOnError
-          ? { error: (r as any).error, code: (r as any).code, __status: (r as any).__status }
-          : { error: (r as any).error, code: (r as any).code };
-      } else {
-        results[id] = (r as any).data as T;
+      try {
+        const ex = await opts.extractEntityId(c, id);
+        if (!ex.ok) {
+          failures++;
+          results[id] = { error: ex.error, code: ex.code };
+          logger.warn('Batch item failed to extract entity id', { id, error: ex.error, code: ex.code, requestId });
+          return;
+        }
+        const r = await opts.fetchOne(ex.entityId);
+        if ((r as any)?.__error) {
+          failures++;
+          const errPayload = includeStatusOnError
+            ? { error: (r as any).error, code: (r as any).code, __status: (r as any).__status }
+            : { error: (r as any).error, code: (r as any).code };
+          results[id] = errPayload as any;
+          logger.warn('Batch item fetch failed', { id, entityId: ex.entityId, error: (r as any).error, code: (r as any).code, requestId });
+        } else {
+          successes++;
+          results[id] = (r as any).data as T;
+        }
+      } catch (e: any) {
+        failures++;
+        const message = e?.message || 'Unexpected error';
+        results[id] = { error: message, code: 'INTERNAL_ERROR' };
+        logger.error('Batch item threw unexpected error', { id, error: message, requestId });
       }
     },
     { concurrency, minDelayMs, maxDelayMs, signal: c.get('signal') as any }
   );
 
+  const durationMs = Date.now() - startedAt;
+  logger.info('Batch end', { count: ids.length, successes, failures, durationMs, requestId });
   return results;
 }
 
@@ -77,16 +99,16 @@ export function extractFromNavigation(
       if (allowFallback) {
         return { ok: true, entityId: id };
       }
-      return { ok: false, error: 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed', code: 'BAD_REQUEST' as ErrorCode };
+      return { ok: false, error: msgNavInputInvalid(), code: 'BAD_REQUEST' as ErrorCode };
     }
 
     const url = urlById?.get(id) ?? null;
     if (!url) {
-      return { ok: false, error: 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed', code: 'BAD_REQUEST' as ErrorCode };
+      return { ok: false, error: msgNavInputInvalid(), code: 'BAD_REQUEST' as ErrorCode };
     }
 
     const ep = endpointMap.get(url);
-    if (!ep) return { ok: false, error: `${fields[0] === 'browseId' ? 'Channel' : 'Video'} ID not found`, code: 'BAD_REQUEST' as ErrorCode };
+    if (!ep) return { ok: false, error: (fields[0] === 'browseId' ? msgChannelIdNotFound() : msgVideoIdNotFound()), code: 'BAD_REQUEST' as ErrorCode };
     if ((ep as any)?.__error) return { ok: false, error: (ep as any).message, code: (ep as any).code };
 
     const payload = (ep as any)?.payload || {};
@@ -96,6 +118,6 @@ export function extractFromNavigation(
         return { ok: true, entityId: val };
       }
     }
-    return { ok: false, error: `${fields.join('/') } not found`, code: 'BAD_REQUEST' as ErrorCode };
+    return { ok: false, error: msgPayloadFieldsNotFound(fields), code: 'BAD_REQUEST' as ErrorCode };
   };
 }

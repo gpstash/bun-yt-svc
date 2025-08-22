@@ -311,5 +311,6 @@ v1InnertubeCaptionRouter.post('/batch', navigationBatchMiddleware(), async (c: C
     fetchOne: (entityId: string) => fetchOne(c, entityId, l ?? undefined, tl ?? undefined, { swrOnStale: false }) as any,
     includeStatusOnError: true,
   });
+  logger.info('Caption batch processed', { count: ids.length, requestId });
   return c.json(results);
 });

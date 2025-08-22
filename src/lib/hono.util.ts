@@ -61,6 +61,20 @@ export const ERROR_CODES = {
 
 export type ErrorCode = typeof ERROR_CODES[keyof typeof ERROR_CODES];
 
+// Centralized BAD_REQUEST messages for uniform phrasing
+export function msgNavInputInvalid(): string {
+  return 'Only YouTube channel/video URL, channelId, handle, or videoId are allowed';
+}
+export function msgChannelIdNotFound(): string {
+  return 'Channel ID not found';
+}
+export function msgVideoIdNotFound(): string {
+  return 'Video ID not found';
+}
+export function msgPayloadFieldsNotFound(fields: string[]): string {
+  return `${fields.join('/')} not found`;
+}
+
 function detectYouTubeError(err: unknown): { status: number; code: ErrorCode; message: string } | undefined {
   if (!err) return undefined;
   const name = (err as any)?.name as string | undefined;
