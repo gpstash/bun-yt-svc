@@ -13,6 +13,9 @@ export const configSchema = z.object({
   CHANNEL_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24), // 1 day
   TRANSCRIPT_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24), // 1 day
   CAPTION_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24), // 1 day
+  // Prefer longer navigation cache to avoid repeated resolveURL calls.
+  // If set, this overrides VIDEO/CHANNEL cache TTLs used in navigation.helper.
+  NAVIGATION_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24 * 30), // 30 days
   // Batch throttling controls for safe crawling
   INNERTUBE_BATCH_CONCURRENCY: z.coerce.number().int().positive().max(10).default(3),
   INNERTUBE_BATCH_MIN_DELAY_MS: z.coerce.number().int().positive().default(150),

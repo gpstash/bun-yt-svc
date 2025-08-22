@@ -265,7 +265,39 @@ v1InnertubeTranscriptRouter.post('/batch', navigationBatchMiddleware(), async (c
       extractEntityId: extractFromNavigation('videoId'),
       fetchOne: (entityId: string) => fetchOne(c, entityId, l),
       getCachedManyByEntityId: async (entityIds) => {
-        if (!l) return new Map();
+        // If no requested language is provided, try alias-based pre-check to avoid unnecessary throttling.
+        if (!l) {
+          const aliasKeys = entityIds.map((eid) => `yt:transcript:${eid}:_alias`);
+          const aliasMap = await redisMGetJson<string>(aliasKeys);
+          const transcriptKeys: string[] = [];
+          const keyToEntity: string[] = [];
+          for (let i = 0; i < entityIds.length; i++) {
+            const ak = aliasKeys[i];
+            const alias = aliasMap.get(ak);
+            if (alias && typeof alias === 'string' && alias.length > 0) {
+              transcriptKeys.push(buildCacheKey(entityIds[i], alias));
+              keyToEntity.push(entityIds[i]);
+            }
+          }
+          const cached = transcriptKeys.length > 0 ? await redisMGetJson<any>(transcriptKeys) : new Map<string, any>();
+          const out = new Map<string, any>();
+          for (let i = 0; i < transcriptKeys.length; i++) {
+            const k = transcriptKeys[i];
+            const eid = keyToEntity[i];
+            const val = cached.get(k);
+            if (val) out.set(eid, val);
+          }
+          logger.debug('Transcript batch cache pre-check (alias-based)', {
+            requested: entityIds.length,
+            aliasResolved: transcriptKeys.length,
+            hits: out.size,
+            language: null,
+            requestId: c.get('requestId'),
+          });
+          return out;
+        }
+
+        // Deterministic check when language is provided
         const keys = entityIds.map((eid) => buildCacheKey(eid, l));
         const m = await redisMGetJson<any>(keys);
         const out = new Map<string, any>();

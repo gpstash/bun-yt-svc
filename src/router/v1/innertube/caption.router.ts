@@ -19,7 +19,7 @@ const logger = createLogger('router:v1:innertube:caption');
 logger.debug('Initializing /v1/innertube/caption router');
 
 // Only negative-cache language-related 4xx codes
-const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode> ([
+const LANG_RELATED_CODES: Set<ErrorCode> = new Set<ErrorCode>([
   ERROR_CODES.INVALID_LANGUAGE,
   ERROR_CODES.INVALID_TRANSLATE_LANGUAGE,
   ERROR_CODES.YT_TRANSLATION_UNSUPPORTED,
@@ -107,7 +107,7 @@ async function fetchOne(
       if (!tlOk || !srcOk) {
         return { __error: true, error: 'Invalid translate language', code: ERROR_CODES.INVALID_TRANSLATE_LANGUAGE, __status: 400 } as const;
       }
-    } catch {/* ignore and proceed */}
+    } catch {/* ignore and proceed */ }
   }
 
   const result = await swrResolve<any, { language: string; segments: Array<{ text: string }>; words: Array<{ text: string }>; updatedAt: Date }>(
@@ -307,12 +307,45 @@ v1InnertubeCaptionRouter.post('/batch', navigationBatchMiddleware(), async (c: C
   }
 
   const results = await processBatchIds(c, ids, {
+    maxConcurrency: 1,
     extractEntityId: extractFromNavigation('videoId', { allowFallbackRawIdWhenNoMap: true }),
     fetchOne: (entityId: string) => fetchOne(c, entityId, l ?? undefined, tl ?? undefined, { swrOnStale: false }) as any,
     includeStatusOnError: true,
     getCachedManyByEntityId: async (entityIds) => {
-      // Only deterministic when a requested language is provided.
-      if (!l && !tl) return new Map();
+      // If no requested language/translate is provided, try alias-based pre-check to avoid unnecessary throttling.
+      if (!l && !tl) {
+        const aliasKeys = entityIds.map((eid) => `yt:caption:${eid}:_alias`);
+        const aliasMap = await redisMGetJson<string>(aliasKeys);
+        const captionKeys: string[] = [];
+        const captionKeyToEntity: string[] = [];
+        for (let i = 0; i < entityIds.length; i++) {
+          const ak = aliasKeys[i];
+          const alias = aliasMap.get(ak);
+          if (alias && typeof alias === 'string' && alias.length > 0) {
+            captionKeys.push(buildCacheKey(entityIds[i], alias, undefined));
+            captionKeyToEntity.push(entityIds[i]);
+          }
+        }
+        const cached = captionKeys.length > 0 ? await redisMGetJson<any>(captionKeys) : new Map<string, any>();
+        const out = new Map<string, any>();
+        for (let i = 0; i < captionKeys.length; i++) {
+          const k = captionKeys[i];
+          const eid = captionKeyToEntity[i];
+          const val = cached.get(k);
+          if (val) out.set(eid, val);
+        }
+        logger.debug('Caption batch cache pre-check (alias-based)', {
+          requested: entityIds.length,
+          aliasResolved: captionKeys.length,
+          hits: out.size,
+          language: null,
+          translateLanguage: null,
+          requestId: c.get('requestId'),
+        });
+        return out;
+      }
+
+      // Deterministic when a requested language (and optional translate) is provided.
       const keys = entityIds.map((eid) => buildCacheKey(eid, l ?? undefined, tl ?? undefined));
       const m = await redisMGetJson<any>(keys);
       const out = new Map<string, any>();

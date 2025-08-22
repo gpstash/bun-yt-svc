@@ -224,13 +224,17 @@ export async function resolveNavigationWithCache(
   config: {
     VIDEO_CACHE_TTL_SECONDS: number;
     CHANNEL_CACHE_TTL_SECONDS: number;
+    NAVIGATION_CACHE_TTL_SECONDS?: number;
   },
 ): Promise<any> {
   const isWatch = isValidYoutubeWatchUrl(url);
   const isPlaylist = !isWatch && isValidYoutubePlaylistUrl(url);
   const videoTtl = config.VIDEO_CACHE_TTL_SECONDS;
   const channelTtl = config.CHANNEL_CACHE_TTL_SECONDS;
-  const ttl = isWatch ? videoTtl : channelTtl;
+  // Prefer explicit navigation TTL when provided; otherwise fallback to type-based TTL
+  const ttl = (config.NAVIGATION_CACHE_TTL_SECONDS && config.NAVIGATION_CACHE_TTL_SECONDS > 0)
+    ? config.NAVIGATION_CACHE_TTL_SECONDS
+    : (isWatch ? videoTtl : channelTtl);
   const keyType = isWatch ? 'watch' : (isPlaylist ? 'playlist' : 'channel');
   const cacheKey = `yt:navigation:${keyType}:${encodeUrl(url)}`;
 
