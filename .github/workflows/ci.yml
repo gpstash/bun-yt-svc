@@ -26,28 +26,7 @@ jobs:
       - name: Run unit tests
         shell: bash
         run: |
-          set -o pipefail
-          bun test --serial 2>&1 | tee test.out
-
-      - name: Summarize failures (names + reasons)
-        if: failure()
-        shell: bash
-        run: |
-          echo "::group::Failed test names"
-          grep -E '^[[:space:]]*✗ ' test.out | sed 's/^[[:space:]]*✗ /- /' || echo "No failed lines found"
-          echo "::endgroup::"
-
-          echo "::group::Failure reasons"
-          grep -E '::error ' test.out | sed 's/^.*title=//' || echo "No ::error annotations found"
-          echo "::endgroup::"
-
-          {
-            echo "### Failed test names"
-            grep -E '^[[:space:]]*✗ ' test.out | sed 's/^[[:space:]]*✗ /- /' || true
-            echo
-            echo "### Failure reasons"
-            grep -E '::error ' test.out | sed 's/^.*title=//' || true
-          } >> "$GITHUB_STEP_SUMMARY"
+          bun test
 
   docker_publish:
     name: Docker Publish (GHCR)
