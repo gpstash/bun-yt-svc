@@ -12,12 +12,22 @@ export function jitterTtl(ttlSeconds: number): number {
   return Math.max(1, Math.floor(base + delta));
 }
 
-// In-process singleflight: coalesce concurrent identical work in the same instance
-const inflight = new Map<string, Promise<any>>();
+// In-process singleflight: coalesce concurrent identical work.
+// Use a global store to survive potential module duplication in certain runners (e.g., Docker + ESM).
+const SINGLEFLIGHT_STORE = Symbol.for('bun-yt-svc:singleflight');
+type InflightStore = Map<string, Promise<any>>;
+const g = globalThis as any;
+if (!g[SINGLEFLIGHT_STORE]) {
+  g[SINGLEFLIGHT_STORE] = new Map<string, Promise<any>>();
+}
+const inflight: InflightStore = g[SINGLEFLIGHT_STORE] as InflightStore;
 export async function singleflight<T>(key: string, doFetch: () => Promise<T>): Promise<T> {
   const existing = inflight.get(key);
   if (existing) return existing as Promise<T>;
-  const p = doFetch()
+  // Schedule doFetch on the next microtask so the inflight entry is visible
+  // to any concurrent callers before doFetch actually runs.
+  const p = Promise.resolve()
+    .then(() => doFetch())
     .catch((e) => { throw e; })
     .finally(() => inflight.delete(key));
   inflight.set(key, p);
