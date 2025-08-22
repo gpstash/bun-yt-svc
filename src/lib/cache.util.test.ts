@@ -21,7 +21,7 @@ describe("cache.util", () => {
   });
 
   test("singleflight coalesces concurrent calls per key", async () => {
-    const { singleflight } = await import("./cache.util");
+    const { singleflight } = await import(realUrl);
     let calls = 0;
     const fetcher = async () => { calls++; return 42; };
     const [a, b, c] = await Promise.all([
@@ -44,7 +44,7 @@ describe("cache.util", () => {
       redisGetJson: async (_k: string) => null,
       redisSetJson: async (_k: string, _v: any, _ttl: number) => {},
     }));
-    const { fetchWithRedisLock } = await import("./cache.util");
+    const { fetchWithRedisLock } = await import(realUrl);
     const res = await fetchWithRedisLock("key", 1, async () => 7, 10);
     expect(res).toBe(7);
   });
@@ -58,7 +58,7 @@ describe("cache.util", () => {
       redisGetJson: async () => null,
       redisSetJson: async () => {},
     }));
-    const { fetchWithRedisLock } = await import("./cache.util");
+    const { fetchWithRedisLock } = await import(realUrl);
     const res = await fetchWithRedisLock("key2", 1, async () => 9, 10);
     expect(res).toBe(9);
   });
@@ -69,7 +69,7 @@ describe("cache.util", () => {
   });
 
   test("isNegativeCache/makeNegativeCache roundtrip", async () => {
-    const { isNegativeCache, makeNegativeCache } = await import("./cache.util");
+    const { isNegativeCache, makeNegativeCache } = await import(realUrl);
     const obj = makeNegativeCache("msg", "CODE", 404);
     expect(isNegativeCache(obj)).toBe(true);
     expect(obj.error).toBe("msg");

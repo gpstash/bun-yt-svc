@@ -3,7 +3,7 @@ import { AppSchema } from "@/app";
 import { createLogger } from "@/lib/logger.lib";
 import type { Context } from "hono";
 import { ERROR_CODES, mapErrorToHttp, isClientAbort, STATUS_CLIENT_CLOSED_REQUEST } from "@/lib/hono.util";
-import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
+import { redisGetJson, redisSetJson, redisMGetJson } from '@/lib/redis.lib';
 import { jitterTtl, singleflight, fetchWithRedisLock, swrResolve } from '@/lib/cache.util';
 import type { SwrResult } from '@/lib/cache.util';
 import { upsertChannel, getChannelById } from '@/service/channel.service';
@@ -203,6 +203,21 @@ v1InnertubeChannelRouter.post('/batch', navigationBatchMiddleware(), async (c: C
     const results = await processBatchIds(c, ids, {
       extractEntityId: extractFromNavigation('browseId'),
       fetchOne: (entityId: string) => fetchChannel(c, entityId, { serveStale: false }) as any,
+      getCachedManyByEntityId: async (entityIds) => {
+        const keys = entityIds.map((eid) => buildCacheKey(eid));
+        const m = await redisMGetJson<any>(keys);
+        const out = new Map<string, any>();
+        for (const eid of entityIds) {
+          const val = m.get(buildCacheKey(eid));
+          if (val) out.set(eid, val);
+        }
+        logger.debug('Channel batch cache pre-check', {
+          requested: entityIds.length,
+          hits: out.size,
+          requestId: c.get('requestId'),
+        });
+        return out;
+      },
     });
     logger.info('Channel batch processed', { count: ids.length, requestId });
     return c.json(results as ChannelBatchResponse);

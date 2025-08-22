@@ -133,6 +133,32 @@ Notes:
 - Playlist batch uses a custom extractor to support channel uploads (`UC..` -> `UU..`) and raw playlist ID/url fallback.
 - Ensure `navigationBatchMiddleware()` is mounted so URL->endpoint maps are available to extractors.
 
+### Bulk cache pre-checks (Redis MGET)
+
+Batch endpoints implement an optional Redis bulk pre-check to skip throttling and upstream fetches for cached items. This is wired via `getCachedManyByEntityId` passed to `processBatchIds()` and uses a gzip-aware helper `redisMGetJson()` in `src/lib/redis.lib.ts`.
+
+- Video: builds keys `yt:video:${videoId}`.
+- Channel: `yt:channel:${channelId}`.
+- Playlist: `yt:playlist:${playlistId}` (per router helper).
+- Transcript: `yt:transcript:${videoId}:${l}` — only enabled when query `l` is provided.
+- Caption: `yt:caption:${videoId}:${l}[:${tl}]` — only enabled when `l` or `l`+`tl` are provided.
+
+Logging signals:
+
+- `lib:batch` (from `processBatchIds()`):
+  - `debug` "Batch cache pre-check" with `{ unique, hits, misses, requestId }`.
+- Routers (entity-specific):
+  - `debug` "Video batch cache pre-check" `{ requested, hits, requestId }`.
+  - `debug` "Channel batch cache pre-check" `{ requested, hits, requestId }`.
+  - `debug` "Playlist batch cache pre-check" `{ requested, hits, requestId }`.
+  - `debug` "Transcript batch cache pre-check" `{ requested, hits, language, requestId }`.
+  - `debug` "Caption batch cache pre-check" `{ requested, hits, language, translateLanguage, requestId }`.
+
+Behavior:
+
+- `processBatchIds()` dedupes entity ids, performs the pre-check, then throttles only the cache misses. Behavior remains unchanged when no hook is provided.
+- `redisMGetJson()` pipelines GETs and transparently decodes gzip-prefixed payloads stored as `gz:<base64>`.
+
 
 ## API
 

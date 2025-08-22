@@ -5,7 +5,7 @@ import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODE
 import type { ErrorCode } from '@/lib/hono.util';
 import { HttpError } from '@/lib/http.lib';
 import { z } from 'zod';
-import { redisGetJson, redisSetJson, redisSetJsonGzip } from '@/lib/redis.lib';
+import { redisGetJson, redisSetJson, redisMGetJson } from '@/lib/redis.lib';
 import { swrResolve, jitterTtl } from '@/lib/cache.util';
 import { getCaptionByVideoAndLanguage, hasCaptionLanguage, getPreferredCaptionLanguage, upsertCaption } from '@/service/caption.service';
 import { processBatchIds, extractFromNavigation } from '@/lib/batch.util';
@@ -182,7 +182,7 @@ async function fetchOne(
         try {
           const cacheKeyResolved = buildCacheKey(videoId, resolvedLang, translateLanguage ?? undefined);
           if (cacheKeyResolved !== cacheKey) {
-            await redisSetJsonGzip(cacheKeyResolved, info, jitterTtl(ttlSeconds));
+            await redisSetJson(cacheKeyResolved, info, jitterTtl(ttlSeconds));
           }
         } catch { /* noop */ }
 
@@ -310,6 +310,26 @@ v1InnertubeCaptionRouter.post('/batch', navigationBatchMiddleware(), async (c: C
     extractEntityId: extractFromNavigation('videoId', { allowFallbackRawIdWhenNoMap: true }),
     fetchOne: (entityId: string) => fetchOne(c, entityId, l ?? undefined, tl ?? undefined, { swrOnStale: false }) as any,
     includeStatusOnError: true,
+    getCachedManyByEntityId: async (entityIds) => {
+      // Only deterministic when a requested language is provided.
+      if (!l && !tl) return new Map();
+      const keys = entityIds.map((eid) => buildCacheKey(eid, l ?? undefined, tl ?? undefined));
+      const m = await redisMGetJson<any>(keys);
+      const out = new Map<string, any>();
+      for (let i = 0; i < entityIds.length; i++) {
+        const eid = entityIds[i];
+        const val = m.get(keys[i]);
+        if (val) out.set(eid, val);
+      }
+      logger.debug('Caption batch cache pre-check', {
+        requested: entityIds.length,
+        hits: out.size,
+        language: l ?? null,
+        translateLanguage: tl ?? null,
+        requestId: c.get('requestId'),
+      });
+      return out;
+    },
   });
   logger.info('Caption batch processed', { count: ids.length, requestId });
   return c.json(results);

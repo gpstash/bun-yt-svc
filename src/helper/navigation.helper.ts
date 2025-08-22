@@ -204,8 +204,16 @@ function isChannelIdPath(pathname: string): boolean {
   return re.test(pathname);
 }
 
-function encodeUrl(url: string): string {
+export function encodeUrl(url: string): string {
   return Buffer.from(url, 'utf-8').toString('base64');
+}
+
+// Build the Redis cache key for a navigation URL
+export function buildNavigationCacheKey(url: string): string {
+  const isWatch = isValidYoutubeWatchUrl(url);
+  const isPlaylist = !isWatch && isValidYoutubePlaylistUrl(url);
+  const keyType = isWatch ? 'watch' : (isPlaylist ? 'playlist' : 'channel');
+  return `yt:navigation:${keyType}:${encodeUrl(url)}`;
 }
 
 export async function resolveNavigationWithCache(

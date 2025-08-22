@@ -5,6 +5,7 @@ import { createLogger } from "@/lib/logger.lib";
 import { ERROR_CODES, STATUS_CLIENT_CLOSED_REQUEST, isClientAbort, mapErrorToHttp } from "@/lib/hono.util";
 import { swrResolve } from "@/lib/cache.util";
 import type { SwrResult } from "@/lib/cache.util";
+import { redisMGetJson } from '@/lib/redis.lib';
 import { navigationMiddleware } from "@/middleware/navigation.middleware";
 import { InnertubeService, type ChannelVideo } from "@/service/innertube.service";
 import { readBatchThrottle } from "@/lib/throttle.util";
@@ -210,6 +211,21 @@ v1InnertubePlaylistRouter.post('/batch', navigationBatchMiddleware(), async (c: 
         return { ok: false, error: 'Invalid playlist id or URL', code: ERROR_CODES.BAD_REQUEST } as const;
       },
       fetchOne: (entityId: string) => fetchPlaylist(c, entityId) as any,
+      getCachedManyByEntityId: async (entityIds) => {
+        const keys = entityIds.map((eid) => buildCacheKey(eid));
+        const m = await redisMGetJson<any>(keys);
+        const out = new Map<string, any>();
+        for (const eid of entityIds) {
+          const val = m.get(buildCacheKey(eid));
+          if (val) out.set(eid, val);
+        }
+        logger.debug('Playlist batch cache pre-check', {
+          requested: entityIds.length,
+          hits: out.size,
+          requestId: c.get('requestId'),
+        });
+        return out;
+      },
     });
     logger.info('Playlist batch processed', { count: ids.length, requestId });
     return c.json(results);

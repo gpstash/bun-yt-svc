@@ -4,9 +4,10 @@ import type { Context, Next } from "hono";
 import { createLogger } from "@/lib/logger.lib";
 import { BatchIdsSchema } from '@/schema/navigation.schema';
 import { ERROR_CODES, mapErrorToHttp } from "@/lib/hono.util";
-import { buildYoutubeUrlFromId, resolveNavigationWithCache } from "@/helper/navigation.helper";
+import { buildYoutubeUrlFromId, resolveNavigationWithCache, buildNavigationCacheKey } from "@/helper/navigation.helper";
 import { throttleMap, readBatchThrottle, dedupeOrdered } from "@/lib/throttle.util";
 import type { NavigationMapValue } from '@/types/navigation.types';
+import { redisGetJson } from "@/lib/redis.lib";
 
 const logger = createLogger('middleware:navigation-batch');
 
@@ -57,29 +58,48 @@ export function navigationBatchMiddleware(): MiddlewareHandler<AppSchema> {
       }
 
       try {
-        logger.debug('Resolve URLs (throttled)', { urlsCount: uniqueUrls.length, inputCount: ids.length, idDedupedCount: uniqueIds.length, urlDedupedCount: uniqueUrls.length, requestId });
         const cfg: any = c.get('config');
-        const { concurrency, minDelayMs, maxDelayMs } = readBatchThrottle(cfg, { maxConcurrency: 5, minDelayFloorMs: 50 });
-        const results = await throttleMap<string, NavigationMapValue | any>(
-          uniqueUrls,
-          async (url: string) => {
-            try {
-              return await resolveNavigationWithCache(innertubeSvc.getInnertube(), url, cfg);
-            } catch (e) {
-              const mapped = mapErrorToHttp(e);
-              // Return an error object to be handled per-id downstream
-              return { __error: true, message: mapped.message || 'Internal Server Error', code: mapped.code, status: mapped.status };
-            }
-          },
-          { concurrency, minDelayMs, maxDelayMs, signal: c.get('signal') as any }
-        );
-        logger.debug('Resolved URLs (with per-item status)', { count: results.length, requestId });
-        // Build URL -> result map (endpoint or error object)
         const endpointMap = new Map<string, NavigationMapValue | any>();
-        for (let i = 0; i < uniqueUrls.length; i++) {
-          endpointMap.set(uniqueUrls[i], results[i]);
+
+        // Fast path: pre-check cache to avoid throttling when fully cached
+        const misses: string[] = [];
+        await Promise.all(
+          uniqueUrls.map(async (url) => {
+            const key = buildNavigationCacheKey(url);
+            const cached = await redisGetJson<any>(key).catch(() => null);
+            if (cached) {
+              endpointMap.set(url, cached);
+            } else {
+              misses.push(url);
+            }
+          })
+        );
+
+        if (misses.length === 0) {
+          logger.debug('Resolved URLs entirely from cache (no throttle)', { count: uniqueUrls.length, requestId });
+          c.set('navigationEndpointMap', endpointMap);
+        } else {
+          logger.debug('Resolve URLs (throttled for cache misses)', { urlsCount: uniqueUrls.length, misses: misses.length, requestId });
+          const { concurrency, minDelayMs, maxDelayMs } = readBatchThrottle(cfg, { maxConcurrency: 5, minDelayFloorMs: 50 });
+          const results = await throttleMap<string, NavigationMapValue | any>(
+            misses,
+            async (url: string) => {
+              try {
+                return await resolveNavigationWithCache(innertubeSvc.getInnertube(), url, cfg);
+              } catch (e) {
+                const mapped = mapErrorToHttp(e);
+                // Return an error object to be handled per-id downstream
+                return { __error: true, message: mapped.message || 'Internal Server Error', code: mapped.code, status: mapped.status };
+              }
+            },
+            { concurrency, minDelayMs, maxDelayMs, signal: c.get('signal') as any }
+          );
+          for (let i = 0; i < misses.length; i++) {
+            endpointMap.set(misses[i], results[i]);
+          }
+          logger.debug('Resolved URLs (cache hits + fetched misses)', { total: uniqueUrls.length, hits: uniqueUrls.length - misses.length, misses: misses.length, requestId });
+          c.set('navigationEndpointMap', endpointMap);
         }
-        c.set('navigationEndpointMap', endpointMap);
       } catch (err) {
         const mapped = mapErrorToHttp(err);
         // Log and continue; downstream will resolve per-id as needed

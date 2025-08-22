@@ -5,7 +5,7 @@ import type { AppSchema } from '@/app';
 import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODES } from '@/lib/hono.util';
 import type { ErrorCode } from '@/lib/hono.util';
 import { z } from 'zod';
-import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
+import { redisGetJson, redisSetJson, redisMGetJson } from '@/lib/redis.lib';
 import { swrResolve } from '@/lib/cache.util';
 import { getTranscriptByVideoAndLanguage, upsertTranscript, getPreferredTranscriptLanguage, hasTranscriptLanguage } from '@/service/transcript.service';
 import { processBatchIds, extractFromNavigation } from '@/lib/batch.util';
@@ -264,6 +264,24 @@ v1InnertubeTranscriptRouter.post('/batch', navigationBatchMiddleware(), async (c
     const results = await processBatchIds(c, ids, {
       extractEntityId: extractFromNavigation('videoId'),
       fetchOne: (entityId: string) => fetchOne(c, entityId, l),
+      getCachedManyByEntityId: async (entityIds) => {
+        if (!l) return new Map();
+        const keys = entityIds.map((eid) => buildCacheKey(eid, l));
+        const m = await redisMGetJson<any>(keys);
+        const out = new Map<string, any>();
+        for (let i = 0; i < entityIds.length; i++) {
+          const eid = entityIds[i];
+          const val = m.get(keys[i]);
+          if (val) out.set(eid, val);
+        }
+        logger.debug('Transcript batch cache pre-check', {
+          requested: entityIds.length,
+          hits: out.size,
+          language: l ?? null,
+          requestId: c.get('requestId'),
+        });
+        return out;
+      },
     });
     logger.info('Transcript batch processed', { count: ids.length, requestId });
     return c.json(results);

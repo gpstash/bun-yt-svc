@@ -6,6 +6,7 @@ import { isClientAbort, STATUS_CLIENT_CLOSED_REQUEST, mapErrorToHttp, ERROR_CODE
 import { z } from 'zod';
 import { upsertVideo, getVideoById } from '@/service/video.service';
 import { jitterTtl, swrResolve } from '@/lib/cache.util';
+import { redisMGetJson } from '@/lib/redis.lib';
 import { processBatchIds, extractFromNavigation } from '@/lib/batch.util';
 import { navigationMiddleware } from '@/middleware/navigation.middleware';
 import { navigationBatchMiddleware } from '@/middleware/navigation-batch.middleware';
@@ -118,6 +119,21 @@ v1InnertubeVideoRouter.post('/batch', navigationBatchMiddleware(), async (c: Con
     const results = await processBatchIds(c, ids, {
       extractEntityId: extractFromNavigation('videoId'),
       fetchOne: (entityId: string) => resolveVideo(c, entityId, { swrOnStale: false }) as any,
+      getCachedManyByEntityId: async (entityIds) => {
+        const keys = entityIds.map((eid) => buildCacheKey(eid));
+        const m = await redisMGetJson<any>(keys);
+        const out = new Map<string, any>();
+        for (const eid of entityIds) {
+          const val = m.get(buildCacheKey(eid));
+          if (val) out.set(eid, val);
+        }
+        logger.debug('Video batch cache pre-check', {
+          requested: entityIds.length,
+          hits: out.size,
+          requestId: c.get('requestId'),
+        });
+        return out;
+      },
     });
     logger.info('Video batch processed', { count: ids.length, requestId });
     return c.json(results);
