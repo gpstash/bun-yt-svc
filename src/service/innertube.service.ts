@@ -66,15 +66,6 @@ export class InnertubeService {
     return this.innertube;
   }
 
-  // #region small helpers
-  private static sleep(ms: number): Promise<void> {
-    return new Promise((res) => setTimeout(res, ms));
-  }
-  private static rand(min: number, max: number): number {
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-  }
-  // #endregion
-
   /**
    * Fetch and parse video information with a normalized shape safe for clients.
    */
