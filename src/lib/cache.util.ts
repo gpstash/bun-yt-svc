@@ -1,5 +1,5 @@
 import { redisAcquireLock, redisReleaseLock, redisWaitForKey } from '@/lib/redis.lib';
-import { redisGetJson, redisSetJsonGzip } from '@/lib/redis.lib';
+import { redisGetJson, redisSetJson } from '@/lib/redis.lib';
 import { mapErrorToHttp, ERROR_CODES } from '@/lib/hono.util';
 
 // Add small TTL jitter (±10%) to avoid synchronized expirations (stampedes)
@@ -108,7 +108,7 @@ export async function swrResolve<T, DbT>(handlers: SwrHandlers<T, DbT>): Promise
       if (age < ttlSeconds) {
         const remaining = Math.max(1, ttlSeconds - age);
         const assembled = await assembleFromDb(dbRes, remaining);
-        try { await redisSetJsonGzip(cacheKey, assembled, jitterTtl(remaining)); } catch { /* noop */ }
+        try { await redisSetJson(cacheKey, assembled, jitterTtl(remaining)); } catch { /* noop */ }
         return { data: assembled };
       }
       // Stale-while-revalidate
@@ -118,7 +118,7 @@ export async function swrResolve<T, DbT>(handlers: SwrHandlers<T, DbT>): Promise
           try {
             await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
               const fresh = await fetchPersist();
-              try { await redisSetJsonGzip(cacheKey, fresh, jitterTtl(ttlSeconds)); } catch { /* noop */ }
+              try { await redisSetJson(cacheKey, fresh, jitterTtl(ttlSeconds)); } catch { /* noop */ }
               return fresh;
             });
           } catch (e) {
@@ -128,7 +128,7 @@ export async function swrResolve<T, DbT>(handlers: SwrHandlers<T, DbT>): Promise
               : (mapped.status >= 400 && mapped.status < 500 && mapped.code === ERROR_CODES.BAD_REQUEST);
             if (shouldNeg) {
               const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-              try { await redisSetJsonGzip(cacheKey, neg, jitterTtl(60)); } catch { /* noop */ }
+              try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch { /* noop */ }
             }
           }
         })();
@@ -144,7 +144,7 @@ export async function swrResolve<T, DbT>(handlers: SwrHandlers<T, DbT>): Promise
     const info = await singleflight(cacheKey, async () => {
       return await fetchWithRedisLock(cacheKey, ttlSeconds, async () => {
         const r = await fetchPersist();
-        try { await redisSetJsonGzip(cacheKey, r, jitterTtl(ttlSeconds)); } catch { /* noop */ }
+        try { await redisSetJson(cacheKey, r, jitterTtl(ttlSeconds)); } catch { /* noop */ }
         return r;
       });
     });
@@ -156,7 +156,7 @@ export async function swrResolve<T, DbT>(handlers: SwrHandlers<T, DbT>): Promise
       : (mapped.status >= 400 && mapped.status < 500 && mapped.code === ERROR_CODES.BAD_REQUEST);
     if (shouldNeg) {
       const neg = makeNegativeCache(mapped.message || 'Bad Request', mapped.code, mapped.status);
-      try { await redisSetJsonGzip(cacheKey, neg, jitterTtl(60)); } catch { /* noop */ }
+      try { await redisSetJson(cacheKey, neg, jitterTtl(60)); } catch { /* noop */ }
     }
     return { __error: true, error: mapped.message || 'Internal Server Error', code: mapped.code, __status: mapped.status };
   }

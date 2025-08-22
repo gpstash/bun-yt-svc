@@ -155,22 +155,6 @@ export async function redisSetJson<T>(key: string, value: T, ttlSeconds: number)
   }
 }
 
-// Always-compress variant to minimize storage usage irrespective of payload size
-export async function redisSetJsonGzip<T>(key: string, value: T, ttlSeconds: number): Promise<void> {
-  const r = getRedis();
-  if (!r) return;
-  try {
-    await ensureReady(r);
-    const plain = JSON.stringify(value);
-    const gz = gzipSync(Buffer.from(plain, 'utf8'));
-    const b64 = gz.toString('base64');
-    const toStore = Buffer.from(COMPRESS_PREFIX + b64, 'utf8');
-    await r.set(key as any, toStore as any, 'EX', ttlSeconds);
-  } catch (err) {
-    logger.error('redisSetJsonGzip failed', { key, ...toErrorMeta(err) });
-  }
-}
-
 // Bulk MGET helper with gzip-aware decoding. Returns a Map of key -> parsed JSON.
 export async function redisMGetJson<T>(keys: readonly string[]): Promise<Map<string, T>> {
   const r = getRedis();
