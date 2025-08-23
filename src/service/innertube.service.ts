@@ -781,10 +781,27 @@ export class InnertubeService {
       const errorScreen = info?.playability_status?.error_screen as { video_id?: string } | undefined;
       const videoId = info.has_trailer && info.getTrailerInfo() === null ? (errorScreen?.video_id ?? id) : id;
 
+      const ctx = InnertubeService.requestContext.getStore();
+      logger.debug('WEB_EMBEDDED bypass:prepared', {
+        id,
+        chosenVideoId: videoId,
+        hasTrailer: info.has_trailer,
+        status: info?.playability_status?.status,
+        reason: (info as any)?.playability_status?.reason,
+        requestId: ctx?.requestId,
+      });
+
       // getBasicInfo needs the signature timestamp (sts) from inside the player
       webEmbeddedInnertube.session.player = webInnertube.session.player;
 
+      logger.debug('WEB_EMBEDDED bypass:start', { videoId, requestId: ctx?.requestId });
       const bypassedInfo = await webEmbeddedInnertube.getBasicInfo(videoId, { client: 'WEB_EMBEDDED', po_token: po });
+      logger.debug('WEB_EMBEDDED bypass:result', {
+        videoId,
+        status: bypassedInfo?.playability_status?.status,
+        hasStreaming: !!bypassedInfo?.streaming_data,
+        requestId: ctx?.requestId,
+      });
       if (bypassedInfo?.playability_status?.status === 'OK' && bypassedInfo?.streaming_data) {
         info.playability_status = bypassedInfo.playability_status;
         info.streaming_data = bypassedInfo.streaming_data;
@@ -793,6 +810,11 @@ export class InnertubeService {
         info.captions = bypassedInfo.captions;
         info.storyboards = bypassedInfo.storyboards;
 
+        logger.info('WEB_EMBEDDED bypass:success', {
+          videoId,
+          clientName: webEmbeddedInnertube.session.context.client.clientName,
+          requestId: ctx?.requestId,
+        });
         return {
           updated: true,
           clientName: webEmbeddedInnertube.session.context.client.clientName,

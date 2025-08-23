@@ -32,6 +32,58 @@ suiteBeforeAll(() => {
   }));
 });
 
+describe("InnertubeService.getVideoInfoWithPoToken (integration-ish)", () => {
+  it("applies WEB_EMBEDDED bypass and augments streaming/caption URLs with Po tokens", async () => {
+    const svc = makeSvc();
+
+    // Stub player-enabled innertube and Po token minting
+    const webInn = createInnertubeInstance();
+    jest.spyOn(InnertubeService as any, "createPlayerInnertubeSafe").mockResolvedValue(webInn as any);
+    jest.spyOn(InnertubeService as any, "mintPoTokensSafe").mockResolvedValue({ contentPoToken: "CP", sessionPoToken: "SP" });
+
+    // Arrange initial WEB fetch result as age-restricted trailer scenario
+    const baseInfo: any = {
+      playability_status: { status: "LOGIN_REQUIRED", reason: "Sign in to confirm your age", error_screen: { video_id: "realVid" } },
+      has_trailer: true,
+      getTrailerInfo: () => null,
+      basic_info: { start_timestamp: null, duration: 111 },
+      captions: { caption_tracks: [{ base_url: "https://timed/text?fmt=json3&xosf=1" }] },
+      storyboards: {},
+      streaming_data: undefined,
+    };
+    jest.spyOn(InnertubeService as any, "getWebOrMwebInfoWithRetries").mockResolvedValue({ info: baseInfo, clientName: "WEB" });
+
+    // MWEB best-effort returns nothing so we depend on WEB_EMBEDDED
+    jest.spyOn(InnertubeService as any, "getMwebInfoBestEffort").mockResolvedValue(undefined);
+
+    // Mock bypass to mutate info in-place to a playable state
+    jest.spyOn(InnertubeService as any, "tryWebEmbeddedBypassBestEffort").mockImplementation(async (_inn: any, info: any, _id: string, _po: string) => {
+      info.playability_status = { status: "OK" };
+      info.streaming_data = { dash_manifest_url: "https://dash/manifest.mpd" };
+      info.basic_info.duration = 222;
+      info.captions = { caption_tracks: [{ base_url: "https://timed/text?fmt=json3&xosf=1" }] };
+      info.storyboards = { sb: true };
+      return { updated: true, clientName: "WEB_EMBEDDED", hasTrailer: false, trailerIsAgeRestricted: false };
+    });
+
+    const out = await (svc as any).getVideoInfoWithPoToken("VID", false);
+
+    // Playable now
+    expect(out.playability_status.status).toBe("OK");
+    // Streaming URL augmented with sessionPoToken and mpd_version
+    expect(out.streaming_data.dash_manifest_url).toContain("/pot/SP/");
+    expect(out.streaming_data.dash_manifest_url).toContain("/mpd_version/7");
+
+    // Caption URLs augmented with contentPoToken and clientName propagated from bypass
+    const u = new URL(out.captions.caption_tracks[0].base_url);
+    expect(u.searchParams.get("pot")).toBe("CP");
+    expect(u.searchParams.get("potc")).toBe("1");
+    expect(u.searchParams.get("c")).toBe("WEB_EMBEDDED");
+    expect(u.searchParams.get("fmt")).toBe("json3");
+    expect(u.searchParams.get("xosf")).toBeNull();
+  });
+});
+
 describe("InnertubeService.getChannelVideos", () => {
   function makeChannelWithPages(pages: Array<{ videos: Array<{ video_id: string; title?: { text?: string } }> }>, opts?: { failOnceWith?: Error }) {
     let idx = 0;
@@ -330,5 +382,142 @@ describe("InnertubeService.fetch (player asset cache)", () => {
     expect(http).toHaveBeenCalledTimes(1);
     const text2 = await res2.text();
     expect(text2).toContain("console.log");
+  });
+});
+
+describe("InnertubeService helpers (playability and URL augmentation)", () => {
+  it("needsAgeBypass returns true for age-confirm requirement", () => {
+    const S: any = InnertubeService as any;
+    const info: any = {
+      playability_status: { status: "UNPLAYABLE", reason: "Sign in to confirm your age" },
+      has_trailer: false,
+      getTrailerInfo: () => ({})
+    };
+    expect(S.needsAgeBypass(info, info.has_trailer, false)).toBeTrue();
+  });
+
+  it("needsAgeBypass returns true when trailer is age restricted", () => {
+    const S: any = InnertubeService as any;
+    const info: any = {
+      playability_status: { status: "LOGIN_REQUIRED", reason: "Sign in to confirm your age" },
+      has_trailer: true,
+      getTrailerInfo: () => null,
+    };
+    expect(S.needsAgeBypass(info, true, true)).toBeTrue();
+  });
+
+  it("isUnavailablePlayability detects common unavailable states", () => {
+    const S: any = InnertubeService as any;
+    expect(S.isUnavailablePlayability({ playability_status: { status: "OK" } })).toBeFalse();
+    expect(S.isUnavailablePlayability({ playability_status: { status: "ERROR" } })).toBeTrue();
+    expect(S.isUnavailablePlayability({ playability_status: { status: "UNPLAYABLE" } })).toBeTrue();
+    expect(S.isUnavailablePlayability({ playability_status: { status: "LOGIN_REQUIRED" } })).toBeTrue();
+    expect(S.isUnavailablePlayability({ playability_status: { status: "OK", reason: "Temporarily unavailable" } })).toBeTrue();
+    expect(S.isUnavailablePlayability({ playability_status: { status: "OK", embeddable: false } })).toBeTrue();
+  });
+
+  it("augmentCaptionsWithPot adds pot/potc/c/fmt and removes xosf", () => {
+    const S: any = InnertubeService as any;
+    const info: any = {
+      captions: {
+        caption_tracks: [
+          { base_url: "https://timed/text?fmt=json3&xosf=1" },
+          { base_url: "https://timed/text2?fmt=json3" },
+        ],
+      },
+    };
+    S.augmentCaptionsWithPot(info, "CONTENT_POT", "WEB");
+    for (const track of info.captions.caption_tracks) {
+      const u = new URL(track.base_url);
+      expect(u.searchParams.get("potc")).toBe("1");
+      expect(u.searchParams.get("pot")).toBe("CONTENT_POT");
+      expect(u.searchParams.get("c")).toBe("WEB");
+      expect(u.searchParams.get("fmt")).toBe("json3");
+      expect(u.searchParams.get("xosf")).toBeNull();
+    }
+  });
+
+  it("augmentStreamingDataWithSessionPot appends pot for MPD URLs with and without query", () => {
+    const S: any = InnertubeService as any;
+    const infoWithQuery: any = { streaming_data: { dash_manifest_url: "https://dash/manifest.mpd?foo=bar" } };
+    const infoNoQuery: any = { streaming_data: { dash_manifest_url: "https://dash/manifest.mpd" } };
+
+    S.augmentStreamingDataWithSessionPot(infoWithQuery, "SESSION_POT");
+    const u1 = new URL(infoWithQuery.streaming_data.dash_manifest_url);
+    expect(u1.searchParams.get("pot")).toBe("SESSION_POT");
+    expect(u1.searchParams.get("mpd_version")).toBe("7");
+
+    S.augmentStreamingDataWithSessionPot(infoNoQuery, "SESSION_POT");
+    expect(infoNoQuery.streaming_data.dash_manifest_url).toContain("/pot/SESSION_POT/");
+    expect(infoNoQuery.streaming_data.dash_manifest_url).toContain("/mpd_version/7");
+  });
+});
+
+describe("InnertubeService.tryWebEmbeddedBypassBestEffort", () => {
+  it("merges WEB_EMBEDDED info when bypass succeeds and returns updated=true", async () => {
+    const S: any = InnertubeService as any;
+    // Arrange base innertube (web) and info indicating trailer is age-restricted
+    const webInn = createInnertubeInstance();
+    const info: any = {
+      playability_status: { status: "LOGIN_REQUIRED", reason: "Sign in to confirm your age", error_screen: { video_id: "realVid" } },
+      has_trailer: true,
+      getTrailerInfo: () => null,
+      basic_info: { start_timestamp: 999, duration: 111 },
+      captions: undefined,
+      storyboards: undefined,
+      streaming_data: undefined,
+    };
+
+    // Mock createInnertube to return a WEB_EMBEDDED double
+    const embedded = {
+      getBasicInfo: async (vid: string, opts: any) => ({
+        playability_status: { status: "OK" },
+        streaming_data: { formats: [1] },
+        basic_info: { start_timestamp: 0, duration: 222 },
+        captions: { caption_tracks: [{ base_url: "https://cc?fmt=json3" }] },
+        storyboards: { sb: true },
+      }),
+      session: { context: { client: { clientName: "WEB_EMBEDDED" } }, player: (webInn as any).session.player },
+    } as any;
+    const spyCreate = jest.spyOn(InnertubeService as any, "createInnertube").mockResolvedValue(embedded);
+
+    const res = await S.tryWebEmbeddedBypassBestEffort(webInn as any, info, "originalId", "POTOKEN");
+
+    expect(res.updated).toBeTrue();
+    expect(res.clientName).toBe("WEB_EMBEDDED");
+    expect(res.hasTrailer).toBeFalse();
+    expect(res.trailerIsAgeRestricted).toBeFalse();
+    expect(info.playability_status.status).toBe("OK");
+    expect(info.streaming_data.formats.length).toBe(1);
+    expect(info.basic_info.duration).toBe(222);
+    expect(info.captions).toBeDefined();
+    expect(info.storyboards).toBeDefined();
+
+    spyCreate.mockRestore();
+  });
+
+  it("returns updated=false on failure and preserves trailer flags", async () => {
+    const S: any = InnertubeService as any;
+    const webInn = createInnertubeInstance();
+    const info: any = {
+      playability_status: { status: "LOGIN_REQUIRED", reason: "Sign in to confirm your age" },
+      has_trailer: true,
+      getTrailerInfo: () => null,
+      basic_info: { start_timestamp: null, duration: 111 },
+    };
+
+    const embedded = {
+      getBasicInfo: async () => { throw new Error("fail"); },
+      session: { context: { client: { clientName: "WEB_EMBEDDED" } }, player: (webInn as any).session.player },
+    } as any;
+    const spyCreate = jest.spyOn(InnertubeService as any, "createInnertube").mockResolvedValue(embedded);
+
+    const res = await S.tryWebEmbeddedBypassBestEffort(webInn as any, info, "id", "POTOKEN");
+
+    expect(res.updated).toBeFalse();
+    expect(res.hasTrailer).toBeTrue();
+    expect(res.trailerIsAgeRestricted).toBeTrue();
+
+    spyCreate.mockRestore();
   });
 });
