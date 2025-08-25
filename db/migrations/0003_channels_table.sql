@@ -14,10 +14,10 @@ create table if not exists "yt-svc"."channels" (
   "thumbnails" jsonb not null,
   "tags" jsonb not null,
   "is_unlisted" boolean not null,
-  "subscriber_count" text not null,
-  "view_count" text not null,
+  "subscriber_count" bigint not null,
+  "view_count" bigint not null,
   "joined_date" text not null,
-  "video_count" text not null,
+  "video_count" bigint not null,
   "country" text not null,
   "created_at" timestamp with time zone default now() not null,
   "updated_at" timestamp with time zone default now() not null

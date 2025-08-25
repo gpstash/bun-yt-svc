@@ -38,7 +38,7 @@ describe("parseChannelInfo()", () => {
     expect(out.vanityUrl).toContain("@chan");
     expect(out.isFamilySafe).toBe(true);
     expect(out.keywords).toEqual(["k1"]);
-    expect(out.subscriberCount).toBe("1,234");
+    expect(out.subscriberCount).toBe(1234);
     expect(out.joinedDate).toBe("May 10, 2025");
     expect(out.country).toBe("US");
   });
@@ -47,10 +47,10 @@ describe("parseChannelInfo()", () => {
     const ch = makeChannel({ getAbout: async () => ({ metadata: undefined }) });
     const out = await parseChannelInfo(ch);
     expect(out.description).toBe("");
-    expect(out.subscriberCount).toBe("");
-    expect(out.viewCount).toBe("");
+    expect(out.subscriberCount).toBe(0);
+    expect(out.viewCount).toBe(0);
     expect(out.joinedDate).toBe("");
-    expect(out.videoCount).toBe("");
+    expect(out.videoCount).toBe(0);
     expect(out.country).toBe("");
   });
 });
