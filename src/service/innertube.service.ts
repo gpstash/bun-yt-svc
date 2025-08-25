@@ -34,6 +34,8 @@ export interface ChannelVideo {
   viewCount: string;
 };
 
+export type PlaylistVideo = ChannelVideo;
+
 export class InnertubeService {
   public static instance: InnertubeService;
   constructor(private readonly innertube: Innertube) { }
@@ -399,7 +401,7 @@ export class InnertubeService {
   public async getPlaylistVideos(
     playlistId: string,
     opts?: RequestOptions & { minDelayMs?: number; maxDelayMs?: number; limit?: number; ttlSeconds?: number }
-  ): Promise<ChannelVideo[]> {
+  ): Promise<PlaylistVideo[]> {
     const minDelayMs = Math.max(0, opts?.minDelayMs ?? 50);
     const maxDelayMs = Math.max(minDelayMs, opts?.maxDelayMs ?? 150);
     const limit = Math.max(30, Math.min(5000, Math.floor(opts?.limit ?? 5000)));
@@ -411,18 +413,18 @@ export class InnertubeService {
       const now = Date.now();
 
       type CacheShape = {
-        items: ChannelVideo[];
+        items: PlaylistVideo[];
         firstId: string | null;
         updatedAt: number;
         staleAt: number;
         ttlSeconds: number;
       };
 
-      const fetchAll = async (): Promise<ChannelVideo[]> => {
+      const fetchAll = async (): Promise<PlaylistVideo[]> => {
         const pl = await this.innertube.getPlaylist(playlistId);
         let page = pl;
 
-        const items: ChannelVideo[] = Array.isArray(page?.videos)
+        const items: PlaylistVideo[] = Array.isArray(page?.videos)
           ? this.mapPlaylistVideos(page.videos as unknown as YTNodes.PlaylistVideo[])
           : [];
         const seen = new Set<string>(items.map(v => v.id).filter(Boolean));
