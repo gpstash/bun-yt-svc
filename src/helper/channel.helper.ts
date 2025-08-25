@@ -8,8 +8,8 @@ export interface ParsedChannelInfo {
   vanityUrl: string;
   isFamilySafe: boolean;
   keywords: string[];
-  avatar: Misc.Thumbnail[] | { url: string; width: number; height: number };
-  thumbnail: Misc.Thumbnail[] | { url: string; width: number; height: number };
+  avatars: Misc.Thumbnail[] | { url: string; width: number; height: number };
+  thumbnails: Misc.Thumbnail[] | { url: string; width: number; height: number };
   tags: string[];
   isUnlisted: boolean;
   subscriberCount: string;
@@ -32,12 +32,12 @@ export async function parseChannelInfo(channel: YT.Channel): Promise<ParsedChann
     vanityUrl: channel?.metadata?.vanity_channel_url ?? "",
     isFamilySafe: channel?.metadata?.is_family_safe ?? false,
     keywords: channel?.metadata?.keywords ?? [],
-    avatar: channel?.metadata?.avatar ?? {
+    avatars: channel?.metadata?.avatar ?? {
       url: "",
       width: 0,
       height: 0,
     },
-    thumbnail: channel?.metadata?.thumbnail ?? {
+    thumbnails: channel?.metadata?.thumbnail ?? {
       url: "",
       width: 0,
       height: 0,

@@ -33,7 +33,7 @@ async function fetchChannel(
   c: Context<AppSchema>,
   channelId: string,
   opts?: { serveStale?: boolean }
-) : Promise<SwrResult<ParsedChannelInfo>> {
+): Promise<SwrResult<ParsedChannelInfo>> {
   const ttlSeconds = c.get('config').CHANNEL_CACHE_TTL_SECONDS as number;
   const cacheKey = buildCacheKey(channelId);
 
