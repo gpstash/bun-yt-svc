@@ -13,6 +13,7 @@ import { getPlaylistById, upsertPlaylist, type PlaylistInfo } from "@/service/pl
 import { z } from 'zod';
 import { navigationBatchMiddleware } from '@/middleware/navigation-batch.middleware';
 import { processBatchIds } from '@/lib/batch.util';
+import { parseCount } from '@/helper/channel.helper';
 
 export const v1InnertubePlaylistRouter = new Hono<AppSchema>();
 const logger = createLogger('router:v1:innertube:playlist');
@@ -59,7 +60,7 @@ async function fetchPlaylist(c: Context<AppSchema>, playlistId: string): Promise
   const ttlSeconds = c.get('config').VIDEO_CACHE_TTL_SECONDS as number; // reuse video TTL
   const cacheKey = buildCacheKey(playlistId);
 
-  const result = await swrResolve<PlaylistInfo, { playlist: PlaylistInfo; updatedAt: Date}>({
+  const result = await swrResolve<PlaylistInfo, { playlist: PlaylistInfo; updatedAt: Date }>({
     cacheKey,
     ttlSeconds,
     serveStale: false,
@@ -79,8 +80,8 @@ async function fetchPlaylist(c: Context<AppSchema>, playlistId: string): Promise
           name: playlist?.info?.author?.name,
           url: playlist?.info?.author?.url,
         },
-        videoCount: String(playlist?.info?.total_items ?? ''),
-        viewCount: String(playlist?.info?.views ?? ''),
+        videoCount: parseCount(playlist?.info?.total_items ?? ''),
+        viewCount: parseCount(playlist?.info?.views ?? ''),
         lastUpdated: playlist?.info?.last_updated,
       };
       try { await upsertPlaylist(basic); } catch { /* noop */ }

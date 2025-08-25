@@ -8,8 +8,8 @@ create table if not exists "yt-svc"."playlists" (
   "description" text not null,
   "subtitle" text,
   "author" jsonb not null,
-  "video_count" text not null,
-  "view_count" text not null,
+  "video_count" bigint not null,
+  "view_count" bigint not null,
   "last_updated" text,
   "created_at" timestamp with time zone default now() not null,
   "updated_at" timestamp with time zone default now() not null

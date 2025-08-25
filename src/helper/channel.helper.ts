@@ -22,7 +22,7 @@ export interface ParsedChannelInfo {
 
 // Extract the leading numeric value from a human string like
 // "6,403,179,271 views" or "358,745 videos". Falls back to 0 when invalid.
-function parseCount(input: unknown): number {
+export function parseCount(input: unknown): number {
   if (typeof input === 'number' && Number.isFinite(input)) return input;
   if (typeof input !== 'string') return 0;
 

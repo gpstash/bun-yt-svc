@@ -11,8 +11,8 @@ export type PlaylistInfo = {
   description: string;
   subtitle?: string | null;
   author: { id?: string; name?: string; url?: string };
-  videoCount: string;
-  viewCount: string;
+  videoCount: number;
+  viewCount: number;
   lastUpdated?: string | null;
 };
 
