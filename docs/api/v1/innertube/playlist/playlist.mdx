@@ -1,0 +1,68 @@
+---
+title: Innertube Playlist API
+version: v1
+routeBase: /v1/innertube/playlist
+---
+
+# Playlist
+
+Fetch playlist metadata and videos. Supports channel uploads playlists (UC → UU conversion).
+
+- Router: `src/router/v1/innertube/playlist.router.ts`
+
+## GET /
+
+Return normalized playlist info.
+
+- Accepts playlist URL/id or channel URL/id (converted to uploads `UU...`).
+
+### Request
+- Query: `id` (string, required)
+
+### Response
+- 200: `PlaylistInfo`
+- 400: `{ error, code: "BAD_REQUEST" }` on invalid/missing id
+
+```json title="200 Example"
+{
+  "id": "PL... or UU...",
+  "title": "...",
+  "description": "...",
+  "subtitle": "... or null",
+  "author": { "id": "UC...", "name": "...", "url": "..." },
+  "videoCount": "123",
+  "viewCount": "4567",
+  "lastUpdated": "2024-01-01T00:00:00.000Z"
+}
+```
+
+## GET /videos
+
+Return videos in the playlist.
+
+- Fresh/stale cache with first-page revalidation.
+
+### Request
+- Query: `id` (string, required)
+
+### Response
+- 200: `ChannelVideo[]`
+- 400: `{ error, code: "BAD_REQUEST" }`
+
+```json title="200 Example"
+[
+  { "id": "VIDEO_ID", "type": "Video", "title": "...", "duration": "12:34", "published": "1 day ago", "viewCount": "123,456 views" }
+]
+```
+
+## POST /batch
+
+Batch playlist info fetch.
+
+- Uses `processBatchIds()` with Redis pre-check.
+
+### Request
+- Body: `{ "ids": string[] }` (min 1, max 50)
+
+### Response
+- 200: Object keyed by input → playlist payload or `{ error, code }`.

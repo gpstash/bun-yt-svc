@@ -1,0 +1,94 @@
+---
+title: Innertube Channel API
+version: v1
+routeBase: /v1/innertube/channel
+---
+
+# Channel
+
+Fetch channel metadata and uploaded videos via Innertube.
+
+- Router: `src/router/v1/innertube/channel.router.ts`
+- Helper types: `ParsedChannelInfo` (from `src/helper/channel.helper.ts`), `ChannelVideo` (from `src/service/innertube.service.ts`)
+
+## GET /
+
+Return normalized channel info for a single channel.
+
+- Resolved by `navigationMiddleware()` from `id` (channel URL/handle/channelId or any resolvable YouTube URL).
+- SWR: serve-stale enabled.
+
+### Request
+- Query: `id` (string, required)
+
+### Response
+- 200: `ChannelInfo` (see example)
+- 400: `{ error, code: "BAD_REQUEST" }` when channel id not found
+- 499: `{ error, code: "CLIENT_CLOSED_REQUEST" }`
+- 4xx/5xx upstream mapped via `mapErrorToHttp()`
+
+```json title="200 Example"
+{
+  "id": "UC...",
+  "title": "...",
+  "description": "...",
+  "url": "https://www.youtube.com/channel/UC...",
+  "vanityUrl": "https://www.youtube.com/@handle",
+  "subscriberCount": "1,234,567 subscribers",
+  "viewCount": "123,456,789 views",
+  "joinedDate": "Jan 1, 2020",
+  "videoCount": "123 videos",
+  "country": "US",
+  "avatar": { "url": "...", "width": 88, "height": 88 },
+  "thumbnail": { "url": "...", "width": 800, "height": 800 }
+}
+```
+
+## GET /videos
+
+Return the channel's uploaded videos as a flat list.
+
+- Fresh/stale cache with first-page revalidation and continuation paging.
+
+### Request
+- Query: `id` (string, required)
+
+### Response
+- 200: `ChannelVideo[]`
+- 400: `{ error, code: "BAD_REQUEST" }` when channel id not found
+
+```json title="200 Example"
+[
+  {
+    "id": "VIDEO_ID",
+    "type": "Video",
+    "title": "...",
+    "duration": "12:34",
+    "published": "1 day ago",
+    "viewCount": "123,456 views"
+  }
+]
+```
+
+## POST /batch
+
+Batch fetch channel info for multiple inputs.
+
+- Uses `processBatchIds()` with Redis pre-check to minimize upstream calls.
+
+### Request
+- Body: `{ "ids": string[] }` (min 1, max 50)
+
+### Response
+- 200: Object keyed by original input, each value either channel payload or `{ error, code }`.
+
+```json title="200 Example"
+{
+  "https://www.youtube.com/@handle": {
+    "id": "UC...",
+    "title": "...",
+    "subscriberCount": "..."
+  },
+  "invalid": { "error": "Invalid channel id", "code": "BAD_REQUEST" }
+}
+```

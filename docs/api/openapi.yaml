@@ -1,0 +1,333 @@
+openapi: 3.1.0
+info:
+  title: bun-yt-svc API
+  version: "1.0.0"
+  description: OpenAPI for Innertube v1 endpoints (caption, transcript, video, channel, playlist)
+servers:
+  - url: /
+paths:
+  /v1/innertube/video:
+    get:
+      summary: Get video info
+      parameters:
+        - in: query
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/VideoInfo" } } } }
+        "400": { description: Bad Request, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    post:
+      summary: Batch video info
+      operationId: batchVideo
+      parameters: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids: { type: array, items: { type: string }, minItems: 1, maxItems: 50 }
+              required: [ids]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  oneOf:
+                    - $ref: "#/components/schemas/VideoInfo"
+                    - $ref: "#/components/schemas/Error"
+  /v1/innertube/transcript:
+    get:
+      summary: Get transcript
+      parameters:
+        - in: query
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: l
+          required: false
+          schema: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/TranscriptResponse" } } } }
+        "400": { description: Bad Request, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    post:
+      summary: Batch transcript
+      parameters:
+        - in: query
+          name: l
+          required: false
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids: { type: array, items: { type: string }, minItems: 1, maxItems: 50 }
+              required: [ids]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  oneOf:
+                    - $ref: "#/components/schemas/TranscriptResponse"
+                    - $ref: "#/components/schemas/Error"
+  /v1/innertube/caption:
+    get:
+      summary: Get caption
+      parameters:
+        - in: query
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: l
+          required: false
+          schema: { type: string }
+        - in: query
+          name: tl
+          required: false
+          schema: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CaptionResponse" } } } }
+        "400": { description: Bad Request, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    post:
+      summary: Batch captions
+      parameters:
+        - in: query
+          name: l
+          required: false
+          schema: { type: string }
+        - in: query
+          name: tl
+          required: false
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids: { type: array, items: { type: string }, minItems: 1, maxItems: 50 }
+              required: [ids]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  oneOf:
+                    - $ref: "#/components/schemas/CaptionResponse"
+                    - $ref: "#/components/schemas/Error"
+  /v1/innertube/channel:
+    get:
+      summary: Get channel info
+      parameters:
+        - in: query
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ChannelInfo" } } } }
+        "400": { description: Bad Request, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    post:
+      summary: Batch channels
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids: { type: array, items: { type: string }, minItems: 1, maxItems: 50 }
+              required: [ids]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  oneOf:
+                    - $ref: "#/components/schemas/ChannelInfo"
+                    - $ref: "#/components/schemas/Error"
+  /v1/innertube/channel/videos:
+    get:
+      summary: Get channel videos
+      parameters:
+        - in: query
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/ChannelVideo" } } } } }
+        "400": { description: Bad Request, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/innertube/playlist:
+    get:
+      summary: Get playlist info
+      parameters:
+        - in: query
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/PlaylistInfo" } } } }
+        "400": { description: Bad Request, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    post:
+      summary: Batch playlists
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids: { type: array, items: { type: string }, minItems: 1, maxItems: 50 }
+              required: [ids]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  oneOf:
+                    - $ref: "#/components/schemas/PlaylistInfo"
+                    - $ref: "#/components/schemas/Error"
+  /v1/innertube/playlist/videos:
+    get:
+      summary: Get playlist videos
+      parameters:
+        - in: query
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/ChannelVideo" } } } } }
+        "400": { description: Bad Request, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+components:
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        code: { type: string }
+      required: [error, code]
+    ChannelVideo:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [Video] }
+        title: { type: string }
+        duration: { type: string }
+        published: { type: string }
+        viewCount: { type: string }
+      required: [id, title]
+      additionalProperties: true
+    ChannelInfo:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        description: { type: string }
+        url: { type: string }
+        vanityUrl: { type: string }
+        isFamilySafe: { type: boolean }
+        keywords: { type: array, items: { type: string } }
+        avatar: { type: object, additionalProperties: true }
+        thumbnail: { type: object, additionalProperties: true }
+        tags: { type: array, items: { type: string } }
+        isUnlisted: { type: boolean }
+        subscriberCount: { type: string }
+        viewCount: { type: string }
+        joinedDate: { type: string }
+        videoCount: { type: string }
+        country: { type: string }
+      required: [id, title]
+      additionalProperties: true
+    PlaylistInfo:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        description: { type: string }
+        subtitle: { type: ["string", "null"] }
+        author:
+          type: object
+          properties:
+            id: { type: string }
+            name: { type: string }
+            url: { type: string }
+          additionalProperties: false
+        videoCount: { type: string }
+        viewCount: { type: string }
+        lastUpdated: { type: ["string", "null"] }
+      required: [id, title]
+      additionalProperties: false
+    VideoInfo:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        description: { type: string }
+        thumbnails: { type: array, items: { type: object, additionalProperties: true } }
+        category: { type: string }
+        tags: { type: array, items: { type: string } }
+        duration: { type: number }
+        channel: { type: object, additionalProperties: true }
+        viewCount: { type: number }
+        likeCount: { type: number }
+        isPrivate: { type: boolean }
+        isUnlisted: { type: boolean }
+        isFamilySafe: { type: boolean }
+        publishDate: { type: object, additionalProperties: true }
+      required: [id, title]
+      additionalProperties: true
+    TranscriptResponse:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        transcript:
+          type: object
+          properties:
+            language: { type: string }
+            segments: { type: array, items: { type: object, properties: { text: { type: string } }, additionalProperties: true } }
+            text: { type: string }
+          required: [language, segments]
+          additionalProperties: true
+      required: [id, transcript]
+      additionalProperties: true
+    CaptionResponse:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        caption:
+          type: object
+          properties:
+            hascaption: { type: boolean }
+            language: { type: string }
+            segments: { type: array, items: { type: object, properties: { text: { type: string } }, additionalProperties: true } }
+            words: { type: array, items: { type: object, properties: { text: { type: string } }, additionalProperties: true } }
+            text: { type: string }
+          required: [language, segments]
+          additionalProperties: true
+      required: [id, caption]
+      additionalProperties: true

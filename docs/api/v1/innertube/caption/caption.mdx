@@ -1,0 +1,68 @@
+---
+title: Innertube Caption API
+version: v1
+routeBase: /v1/innertube/caption
+---
+
+# Caption
+
+Fetch video captions (subtitles) with optional translation, language aliasing, SWR caching, and batch support.
+
+- Router: `src/router/v1/innertube/caption.router.ts`
+
+## GET /
+
+Return video info merged with caption.
+
+- Resolved by `navigationMiddleware()` from `id` (video URL or id).
+- SWR: serve-stale enabled.
+
+### Request
+- Query:
+  - `id` (string, required)
+  - `l` (string, optional) language code
+  - `tl` (string, optional) translate target language; requires `l`
+
+### Response
+- 200: Video info + `caption`
+- 400: `{ error, code }` for invalid `l`/`tl` or missing `videoId`
+- 499 and other errors mapped by `mapErrorToHttp()`
+
+```json title="200 Example"
+{
+  "id": "VIDEO_ID",
+  "title": "...",
+  "channel": { "id": "UC...", "name": "...", "url": "..." },
+  "caption": {
+    "hascaption": true,
+    "language": "en",
+    "segments": [{ "text": "...", "start": 0, "end": 1234 }],
+    "words": [{ "text": "...", "start": 0, "end": 350 }],
+    "text": "full caption text ..."
+  }
+}
+```
+
+## POST /batch
+
+Batch caption fetch for multiple inputs.
+
+- Uses `navigationBatchMiddleware()` and `processBatchIds()` with smart cache pre-checks and player warmup.
+
+### Request
+- Query:
+  - `l` (optional), `tl` (optional, requires `l`)
+- Body: `{ "ids": string[] }` (min 1, max 50)
+
+### Response
+- 200: Object keyed by input → value is payload (same as GET `/`) or `{ error, code }`.
+
+```json title="200 Example"
+{
+  "https://www.youtube.com/watch?v=VIDEO_ID": {
+    "id": "VIDEO_ID",
+    "caption": { "language": "en", "segments": [/*...*/], "text": "..." }
+  },
+  "bad": { "error": "Invalid language", "code": "INVALID_LANGUAGE" }
+}
+```

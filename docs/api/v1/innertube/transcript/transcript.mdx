@@ -1,0 +1,52 @@
+---
+title: Innertube Transcript API
+version: v1
+routeBase: /v1/innertube/transcript
+---
+
+# Transcript
+
+Fetch transcripts with language resolution, aliasing, SWR, and batch support.
+
+- Router: `src/router/v1/innertube/transcript.router.ts`
+
+## GET /
+
+Return video info merged with transcript.
+
+- Resolved by `navigationMiddleware()` from `id` (video URL or id).
+- Language resolution: request `l` → alias → DB-preferred → default.
+
+### Request
+- Query:
+  - `id` (string, required)
+  - `l` (string, optional)
+
+### Response
+- 200: Video info + `transcript`
+- 400: `{ error, code }` for invalid `l` or missing `videoId`
+
+```json title="200 Example"
+{
+  "id": "VIDEO_ID",
+  "title": "...",
+  "transcript": {
+    "language": "en",
+    "segments": [{ "text": "..." }],
+    "text": "joined transcript text ..."
+  }
+}
+```
+
+## POST /batch
+
+Batch transcript fetch.
+
+- Uses `navigationBatchMiddleware()` and `processBatchIds()` with alias-aware cache pre-check.
+
+### Request
+- Query: `l` (optional)
+- Body: `{ "ids": string[] }` (min 1, max 50)
+
+### Response
+- 200: Object keyed by input → transcript payload or `{ error, code }`.

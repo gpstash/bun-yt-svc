@@ -1,0 +1,48 @@
+---
+title: Innertube Video API
+version: v1
+routeBase: /v1/innertube/video
+---
+
+# Video
+
+Fetch normalized video info with SWR and batch support.
+
+- Router: `src/router/v1/innertube/video.router.ts`
+
+## GET /
+
+Return video info.
+
+- Resolved by `navigationMiddleware()` from `id` (video URL or id).
+- SWR: serve-stale enabled.
+
+### Request
+- Query: `id` (string, required)
+
+### Response
+- 200: Video info (see example)
+- 400: `{ error, code: "BAD_REQUEST" }` when `videoId` missing
+
+```json title="200 Example"
+{
+  "id": "VIDEO_ID",
+  "title": "...",
+  "thumbnails": [{ "url": "...", "width": 120, "height": 90 }],
+  "duration": 0,
+  "channel": { "id": "UC...", "name": "...", "url": "..." },
+  "publishDate": { "raw": "...", "formatted": "..." }
+}
+```
+
+## POST /batch
+
+Batch video info fetch.
+
+- Uses `processBatchIds()` with Redis pre-check.
+
+### Request
+- Body: `{ "ids": string[] }` (min 1, max 50)
+
+### Response
+- 200: Object keyed by input → video payload or `{ error, code }`.
